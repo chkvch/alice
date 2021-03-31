@@ -1,6 +1,6 @@
 # alice
 
-Oblate fluid planet structure from a fourth-order theory of figures based on [Nettelmann 2017](https://doi.org/10.1051/0004-6361/201731550).
+Oblate fluid planet structure code used for Mankovich & Fuller 2021 (doi not yet assigned). The shape calculation is a fourth-order theory of figures based on [Nettelmann 2017](https://doi.org/10.1051/0004-6361/201731550).
 
 ## Getting started
 
