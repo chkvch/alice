@@ -1,35 +1,47 @@
 # a fourth-order theory of figures based on
-# the summmary in appendix B of Nettelmann (2017)
-# https://arxiv.org/abs/1708.06177v1
-# 2017arXiv170806177N
+# the summmary in appendix B of Nettelmann (2017, A&A 606, A139)
+# doi:10.1051/0004-6361/201731550
 
 import numpy as np
 import const
 from scipy.optimize import root
-from scipy.integrate import trapz, cumtrapz
+from scipy.integrate import trapz, cumtrapz, solve_ivp
 from scipy.interpolate import splrep, splev, interp1d
 from scipy.special import legendre
 import time
 import os
-import ongp
+# import ongp
 
 class ConvergenceError(Exception):
     pass
 
 class ToFAdjustError(Exception):
     pass
-    
+
+class EOSError(Exception):
+    pass
+
+class UnphysicalParameterError(Exception):
+    pass
+
 class model_container:
     '''
     container for quantities not fundamental to the tof4 model, e.g., composition, etc.
     '''
-    pass    
+    pass
 
 class tof4:
-    def __init__(self, tof_params={}, mesh_params={}):
+    def __init__(self, hhe_eos, z_eos, tof_params={}):
+
+        # create a blank model instance to hold info tof doesn't care about directly, like composition and temperature
+        self.model = model_container()
+        # these should be eos instances that each have a 'get' method that takes (logp, logt, {composition parameters})
+        # and returns a dictionary of eos results like logrho, grada, gamma1, etc.
+        self.model.hhe_eos = hhe_eos
+        self.model.z_eos = z_eos
 
         # parse contents of the params dictionary
-        self.max_iters_outer = tof_params['max_iters_outer'] if 'max_iters_outer' in tof_params else 50
+        self.max_iters_outer = tof_params['max_iters_outer'] if 'max_iters_outer' in tof_params else 100
         self.max_iters_inner = tof_params['max_iters_inner'] if 'max_iters_inner' in tof_params else 2
         self.verbosity = tof_params['verbosity'] if 'verbosity' in tof_params else 1
 
@@ -38,15 +50,16 @@ class tof4:
         # tolerance for relative error in the total mass
         self.mtot_rtol = tof_params['mtot_rtol'] if 'mtot_rtol' in tof_params else 1e-5
         # tolerance for relative error in the mean He mass fraction
-        self.ymean_rtol = tof_params['ymean_rtol'] if 'ymean_rtol' in tof_params else 1e-3 
+        self.ymean_rtol = tof_params['ymean_rtol'] if 'ymean_rtol' in tof_params else 1e-3
         # number of zones in the model; use thousands if fidelity in j2n is important
         self.nz = tof_params['nz'] if 'nz' in tof_params else 512
+        # flag to adjust "smallness parameter" (squared spin divided by GM/Rmean^3) to preserve actual spin frequency as mean radius changes during iterations
+        self.adjust_small = tof_params['adjust_small'] if 'adjust_small' in tof_params else True
 
         if not 'save_vector_output' in tof_params.keys():
             tof_params['save_vector_output'] = True
 
         self.params = tof_params
-        self.mesh_params = mesh_params
 
         if 'output_path' in tof_params.keys():
             output_path = tof_params['output_path']
@@ -85,92 +98,168 @@ class tof4:
         assert self.small < 1., 'no supercritical rotation fam.'
         if self.small == 0. and self.verbosity > 0: print('warning: rotation is off.')
 
-        self.mtot = self.params['mtot']
-        self.rtot = self.params['req'] * (1. - self.small ** 2)
+        self.mtot = self.params['mtot'] # important, sets target total mass throughout iterations and enters mean density
+        self.rtot = self.params['req'] * (1. - self.small ** 2) # rough idea of total mean radius; only used to get rough initial model
 
-        # use ongp to generate a basic initial model. this only needs to be a starting point for
-        # rho, p, r; details like the Y and Z distributions will be enforced later during ToF
-        # iterations in the adjust_* method appropriate to the chosen model_type.
-        # set some params that ongp.evol needs to instantiate an ongp.evol object
-        ongp_evol_params = {}
-        ongp_evol_params['nz'] = self.nz
-        ongp_evol_params['atm_option'] = self.params['atm_option']
-        ongp_evol_params['atm_planet'] = self.params['atm_planet']
-        ongp_evol_params['radius_rtol'] = 1e-2 # need not be a good model at all
-        ongp_evol_params['hhe_eos_option'] = self.params['hhe_eos_option']
-        ongp_evol_params['z_eos_option'] = self.params['z_eos_option']
-        ongp_evol_params['f_ice'] = self.params['ice_to_rock']
-        e = ongp.evol(ongp_evol_params, self.mesh_params)
-        # set params that ongp.evol.static needs to build a specific static model.
-        # composition and three-layer structure is arbitrary because it's just an initial guess
-        ongp_model_params = {'mtot':self.mtot, 't1':self.params['t1'], 'z1':0.1, 'y1':0.27, 'model_type':'three_layer'}
-        if 'mcore' in self.params: ongp_model_params['mcore'] = self.params['mcore']
-        e.static(ongp_model_params)
-
-        # check total mass off the bat
-        dm = 4. / 3 * np.pi * e.rho[1:] * (e.r[1:] ** 3 - e.r[:-1] ** 3)
-        dm = np.insert(dm, 0, 4. / 3 * np.pi * e.rho[0] * e.r[0] ** 3)
-        m_calc = np.cumsum(dm)
-        mtot_calc = m_calc[-1]
-        # print( 'initial model: mtot_calc, reldiff', mtot_calc, abs(self.mtot - mtot_calc) / self.mtot)
-
-        self.rho = e.rho
-        self.p = e.p
-        self.l = e.r # pretty arbitrary to copy the radius grid from the ongp model, but it works
-        # ensure some zones very close to center; not necessary for many purposes
-        n = 50
-        self.l[:n] = np.linspace(1e-4, self.l[n-1], n)
-        # self.l = np.linspace(1e-2, 1, len(e.r)) ** 2 * e.r[-1] # works, but poor resolution near surface
-        # self.l = np.logspace(0, -2, len(e.r))[::-1] * e.r[-1] # doesn't work
-
-        # copy over the important parts of this initial ongp.evol instance
-        self.model = model_container()
-
-        self.model.z1 = self.params['z1']
-        if 'z2' in list(self.params): self.model.z2 = self.params['z2']
-        if 'c' in list(self.params): self.model.c = self.params['c']
         self.model.t1 = self.params['t1']
-        if 'mcore' in list(self.params): self.model.mcore = self.params['mcore']
-        if 'mcore' in list(self.params): self.model.kcore = e.kcore
-        self.model.nz = self.nz
+        self.model.f_ice = self.params['f_ice']
+        self.model.y = np.zeros(self.nz)
+        self.model.z = np.zeros(self.nz)
+        self.model.p = np.ones(self.nz) * 1e12
+        self.model.t = np.ones_like(self.model.p) * 1e4
 
-        self.model.p = e.p
-        self.model.t = e.t
-        self.model.y = e.y
-        self.model.z = e.z
+        if 'use_gauss_lobatto' in self.params and self.params['use_gauss_lobatto']:
+            # here we want a prescribed fraction radius versus zone number, so we'll set this
+            # and iterate to get roughly the correct total mass for our starting model
+            def gauss_lobatto(N,xmin,xmax):
+                '''
+                Constructs Gauss-Lobatto grid and 1st/2nd order spectral
+                derivative matrices appropriate for Chebyshev collocation
+                '''
+                # preliminaries
+                M=N+1
+                x = np.linspace(0,N,M)
+                x = np.cos(np.pi*x/N)
+                # map to physical domain x\in[xmin,xmax]
+                x   = (-x+1.)*(xmax-xmin)/2. + xmin
+                return x
+            self.model.r = gauss_lobatto(self.nz-1, 0., 1.) * self.rtot
+            self.model.dr = np.gradient(self.model.r)
+            t0 = time.time()
+            z = 0.1
+            # iterate for a very rough 1d starting model
+            for i in np.arange(2):
+                hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), 0.275 * (1. - z))
+                z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.f_ice)
+                rhoinv = z / 10 ** z_res['logrho'] + (1. - z) / 10 ** hhe_res['logrho']
+                self.model.rho = rhoinv ** -1. # 10 ** hhe_res['logrho']
+                # integrate mass conservation to update mass
+                self.model.m = cumtrapz(np.pi * 4. * self.model.r ** 2 * self.model.rho, x=self.model.r, initial=0.)
+                self.model.m[0] = np.pi * 4. * self.model.rho[0] * self.model.r[0] ** 3 / 3.
+                self.model.dm = np.diff(self.model.m)
+                # integrate hydrostatic balance to update pressure
+                dp = const.cgrav * self.model.m[1:] * self.model.dm / 4. / np.pi / self.model.r[1:] ** 4
+                self.model.p[-1] = 1e6 # 1 bar
+                self.model.p[:-1] = 1e6 + np.cumsum(dp[::-1])[::-1]
+                # integrate adiabatic temperature gradient to update temperature
+                self.model.grada = hhe_res['grada']
+                interp_grada = interp1d(self.model.p, self.model.grada, fill_value='extrapolate') # interp1d(self.p, self.grada)
+                def dtdp(p, t):
+                    # print(f'{p:e} {self.model.p[0]:e} {self.model.p[0]-p:e}')
+                    return t / p * interp_grada(p)
+                p_eval = self.model.p[::-1]
+                assert not np.any(np.isnan(self.model.p))
+                assert not np.any(self.model.p[1:] > self.model.p[0])
+                assert not np.any(self.model.p[:-1] < self.model.p[-1])
+                assert self.model.p[-1] == 1e6
+                assert interp_grada(p_eval[0])
+                assert interp_grada(p_eval[-1])
+                sol = solve_ivp(dtdp, (p_eval[0], p_eval[-1]), np.array([self.model.t1]), t_eval=p_eval)
+                assert sol.success, 'failed in integrate_temperature'
+                self.model.t = sol.y[0][::-1]
+                # check total mass relative to target and adjust the trial value of z to get closer next pass
+                mtot_relerr = (self.mtot - self.model.m[-1]) / self.mtot
+                if self.verbosity > 0:
+                    print(f'{self.model.t[0]:10e} {z:6.3f} {self.model.m[-1]:10e} {mtot_relerr:10e} {time.time() - t0:10f}')
+                z *= np.exp(mtot_relerr)
+        else:
+            # default mesh is a prescribed fractional mass versus zone number; iterate to get roughly correct radius
+            import mesh
+            self.model.m = mesh.mesh(self.nz).mesh_func * self.mtot
+            self.model.dm = np.diff(self.model.m)
+            q = np.zeros_like(self.model.p)
+            if self.verbosity > 0:
+                print('create initial model')
+                print(f"{'tcenter':>10} {'rtot':>10} {'relerr':>10} {'et_s':>10}")
+            t0 = time.time()
+            z = 0.1
+            for i in np.arange(2):
 
-        self.model.grada = e.grada
-        self.model.gradt = e.gradt
+                hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), 0.275 * (1. - z))
+                z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.f_ice)
+                rhoinv = z / 10 ** z_res['logrho'] + (1. - z) / 10 ** hhe_res['logrho']
+                self.model.rho = rhoinv ** -1. # 10 ** hhe_res['logrho']
+                # integrate mass conservation to update radii
+                q[1:] = 3. * self.model.dm / 4 / np.pi / self.model.rho[1:]
+                self.model.r = np.cumsum(q) ** (1. / 3)
+                # integrate hydrostatic balance to update pressure
+                dp = const.cgrav * self.model.m[1:] * self.model.dm / 4. / np.pi / self.model.r[1:] ** 4
+                self.model.p[-1] = 1e6 # 1 bar
+                self.model.p[:-1] = 1e6 + np.cumsum(dp[::-1])[::-1]
+                # integrate adiabatic temperature gradient to update temperature
+                self.model.grada = hhe_res['grada']
+                interp_grada = interp1d(self.model.p, self.model.grada, fill_value='extrapolate') # interp1d(self.p, self.grada)
+                def dtdp(p, t):
+                    # print(f'{p:e} {self.model.p[0]:e} {self.model.p[0]-p:e}')
+                    return t / p * interp_grada(p)
+                p_eval = self.model.p[::-1]
+                assert not np.any(np.isnan(self.model.p))
+                assert not np.any(self.model.p[1:] > self.model.p[0])
+                assert not np.any(self.model.p[:-1] < self.model.p[-1])
+                assert self.model.p[-1] == 1e6
+                assert interp_grada(p_eval[0])
+                assert interp_grada(p_eval[-1])
+                sol = solve_ivp(dtdp, (p_eval[0], p_eval[-1]), np.array([self.model.t1]), t_eval=p_eval)
+                assert sol.success, 'failed in integrate_temperature'
+                self.model.t = sol.y[0][::-1]
+                # check total radius relative to target and adjust the trial value of z to get closer next pass
+                rtot_relerr = (self.rtot - self.model.r[-1]) / self.rtot
+                if self.verbosity > 0:
+                    print(f'{self.model.t[0]:10e} {self.model.r[-1]:10e} {rtot_relerr:10e} {time.time() - t0:10f}')
+                z /= np.exp(rtot_relerr)
 
-        if 'pt' in list(self.params): self.model.ptrans = self.params['pt']
+        # assert False
 
-        self.model.hhe_eos = e.hhe_eos
-        self.model.z_eos = e.z_eos
-        if hasattr(e, 'z_eos_low_t'): self.model.z_eos_low_t = e.z_eos_low_t
-        self.model.z_eos_option = self.params['z_eos_option']
+        if np.any(np.isnan(self.model.p)):
+            nnan = len(self.model.p[np.isnan(self.model.p)])
+            raise EOSError(f'{nnan} nans in pressure after integrate hydrostatic on iteration {self.static_iters}.')
+
+        for key in 'z1', 'z2',:
+            if key in self.params: setattr(self.model, key, self.params[key])
 
         if self.params['model_type'] == 'three_layer':
-            self.model.mcore = e.mcore
+            self.model.mcore = self.params['mcore']
             self.model.y1 = self.params['y1']
-        elif self.params['model_type'] == 'cosine_yz':
-            self.model.c = self.params['c'] # y/z gradient centroid
-            self.model.w = self.params['w'] # y/z gradient full-width
-            self.model.y1_xy = self.params['y1_xy'] # y/(x+y) of uniform outer envelope
-            try:
-                self.model.y2_xy = self.params['y2_xy'] # y/(x+y) of "helium shell"
-            except KeyError:
-                self.model.y2_xy = None # adjust will catch this and set y2_xy=y1_xy
-        elif self.params['model_type'] == 'linear_yz':
-            self.model.c = self.params['c'] # y/z gradient centroid
-            self.model.w = self.params['w'] # y/z gradient full-width
-            self.model.y1_xy = self.params['y1_xy'] # y/(x+y) of uniform outer envelope
-            try:
-                self.model.y2_xy = self.params['y2_xy'] # y/(x+y) of "helium shell"
-            except KeyError:
-                self.model.y2_xy = None # adjust will catch this and set y2_xy=y1_xy
+            self.model.kcore = np.where(self.model.m > self.model.mcore * const.mearth)[0][0]
+            self.model.ptrans = self.params['pt']
+        elif self.params['model_type'] == 'continuous':
 
-        self.model.get_rho_xyz = e.get_rho_xyz
-        self.model.get_rho_z = e.get_rho_z
+            if 'c1' in self.params: # dual cavity model
+                assert 'w' not in self.params
+                assert 'c' not in self.params
+                self.model.c1 = self.params['c1']
+                self.model.c2 = self.params['c2']
+                self.model.w1 = self.params['w1']
+                self.model.w2 = self.params['w2']
+
+            elif 'rstab' in self.params: # single cavity model, cavity extending out to r=rstab from either r=rstab_in or r=0 if rstab_in is not defined
+                assert 'w' not in self.params
+                assert 'c' not in self.params
+                self.model.rstab = self.params['rstab']
+                if 'rstab_in' in self.params:
+                    self.model.rstab_in = self.params['rstab_in']
+
+            else: # standard single cavity model: work with gradient centroid and width
+                assert 'c2' not in self.params
+                assert 'c1' not in self.params
+                assert 'w1' not in self.params
+                assert 'w2' not in self.params
+
+                self.model.c = self.params['c'] # y/z gradient centroid
+                self.model.w = self.params['w'] # y/z gradient full-width
+
+            self.model.y1_xy = self.params['y1_xy'] # y/(x+y) of uniform outer envelope
+            try:
+                self.model.y2_xy = self.params['y2_xy'] # y/(x+y) of "helium shell"
+            except KeyError:
+                self.model.y2_xy = None # adjust will catch this and set y2_xy=y1_xy
+        else:
+            raise ValueError(f"model_type {self.params['model_type']} not recognized")
+
+        # copy over primary structure quantities for tof iterations
+        self.l = self.model.r
+        self.rho = self.model.rho
+        self.p = self.model.p
 
     def initialize_tof_vectors(self):
         if self.l[0] == 0.:
@@ -227,8 +316,6 @@ class tof4:
 
 
     def relax(self):
-
-        color_by_outer_iteration = {0:'dodgerblue', 1:'gold', 2:'firebrick', 3:'forestgreen', 4:'purple', 5:'coral', 6:'teal'} # this takes me back
 
         import time
         time_start_outer = time.time()
@@ -381,80 +468,82 @@ class tof4:
                     self.new_mcore = 0.5 * (self.mcore + 30.)
 
                 if self.new_mcore <= 1e-2:
-                    raise ongp.UnphysicalParameterError('model wants negative core mass')
+                    raise UnphysicalParameterError('model wants negative core mass')
 
                 self.adjust_three_layer()
-                
-            elif self.params['model_type'] == 'linear_yz':
-                reldiff = (self.mtot_calc - self.mtot) / self.mtot
-                self.new_c = self.model.c - reldiff
-                if self.new_c < 0.: raise ToFAdjustError(f'linear_yz wants c={self.new_c} < 0.')
-                
-                self.adjust_linear_yz()
-                
-            elif self.params['model_type'] == 'cosine_yz':
-                
+
+            elif self.params['model_type'] == 'continuous':
+
                 self.model.mhe = trapz(self.model.y, x=self.m_calc)
                 self.model.mz = trapz(self.model.z, x=self.m_calc)
-                self.model.mean_y_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
-                self.model.ym = self.model.mhe / self.mtot_calc # current actual M_He / M_tot
-                                
-                if not hasattr(self, 'y1_xy_prev'): self.y1_xy_prev = np.array([])
-                if not hasattr(self, 'mean_y_xy_prev'): self.mean_y_xy_prev = np.array([])
-                if not hasattr(self, 'c_prev'): self.c_prev = np.array([])
-                if not hasattr(self, 'mtot_calc_prev'): self.mtot_calc_prev = np.array([])                
-                self.y1_xy_prev = np.append(self.y1_xy_prev, self.model.y1_xy)
-                self.mean_y_xy_prev = np.append(self.mean_y_xy_prev, self.model.mean_y_xy)
-                self.c_prev = np.append(self.c_prev, self.model.c)
-                self.mtot_calc_prev = np.append(self.mtot_calc_prev, self.mtot_calc)    
-                    
-                mtot_err = self.mtot - self.mtot_calc
+                self.model.ymean_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
+
+                # how badly are we doing with total mass and mean y_xy?
                 mtot_relerr = (self.mtot - self.mtot_calc) / self.mtot
+                ymean_relerr = (self.params['ymean_xy'] - self.model.ymean_xy) / self.params['ymean_xy']
 
-                ymean_err = self.params['mean_y_xy'] - self.model.mean_y_xy
-                ymean_relerr = (self.params['mean_y_xy'] - self.model.mean_y_xy) / self.params['mean_y_xy']
-                
-                if self.outer_iteration < 50:
-                    self.model.c += mtot_relerr # what we usually do
+                # based on the parameters that have been passed, choose which quantity to adjust to get closer to desired total mass
+                if 'c1' in self.params: # dual cavity model; adjust c2
+                    adjust_qty = 'c2'
+                elif 'c' in self.params: # single cavity model; adjust c
+                    adjust_qty = 'c'
+                elif 'rstab' in self.params:
+                    adjust_qty = 'z2' # now preferred
+                    # adjust_qty = 'z1' # seemed like a better handle but the strong covariance w/ y1_xy (varied to satisfy desired ymean) leads to convergence woes
+                    # adjust_qty = 'rstab_in' # bad
 
-                    # this is what we normally do and it works well if y1_xy is not close to zero
-                    f = 1 if self.outer_iteration > 20 else 1.
-                    self.model.y1_xy *= (1. + f * ymean_relerr)
-                else: # try and get a better guess of the appropriate corrections for c and y1_xy simultaneously
-                    
-                    dmtot_dc = (np.diff(self.mtot_calc_prev) / np.diff(self.c_prev))[-1]
-                    c_corr = mtot_err / dmtot_dc
-                    self.model.c += c_corr
-                    
-                    dym_dy1 = (np.diff(self.mean_y_xy_prev) / np.diff(self.y1_xy_prev))[-1]
-                    y1_corr = ymean_err / dym_dy1
-                    self.model.y1_xy += y1_corr
-                        
-                # sanity checks to make sure values make sense, and give up if needed                
-                if self.model.c < 0. and self.outer_iteration > 20: 
-                    raise ToFAdjustError(f'cosine_yz wants c={self.model.c} < 0.')
-                elif self.model.c > 1.:
-                    raise ToFAdjustError(f'cosine_yz wants c={self.model.c} > 1. model might have an unrealistically low total z content.')
-                elif self.model.c < 0.:
-                    try:
-                        self.model.c = 0.5 * self.model.c_prev[-1]
-                    except AttributeError:
-                        self.model.c = 0.1
-                    
+                    # give user the option to override this, e.g., for specific plots
+                    if 'force_adjust_z1' in self.params and self.params['force_adjust_z1']:
+                        adjust_qty = 'z1'
+
+                else:
+                    raise ToFAdjustError('unclear which quantity to adjust to get closer to desired total mass.')
+
+                # not clear if this extra tracking will be necessary but it might if we run into small y1_xy values
+                if not hasattr(self, 'y1_xy_prev'): self.y1_xy_prev = np.array([])
+                if not hasattr(self, 'ymean_xy_prev'): self.ymean_xy_prev = np.array([])
+                if not hasattr(self, 'c_prev'): self.c_prev = np.array([])
+                if not hasattr(self, 'mtot_calc_prev'): self.mtot_calc_prev = np.array([])
+                self.y1_xy_prev = np.append(self.y1_xy_prev, self.model.y1_xy)
+                self.ymean_xy_prev = np.append(self.ymean_xy_prev, self.model.ymean_xy)
+                self.c_prev = np.append(self.c_prev, getattr(self.model, adjust_qty))
+                self.mtot_calc_prev = np.append(self.mtot_calc_prev, self.mtot_calc)
+
+
+                setattr(self.model, adjust_qty, getattr(self.model, adjust_qty) + mtot_relerr)
+                # self.model.c += mtot_relerr
+
+                # this might fail if y1_xy is close to zero
+                f = 1.
+                self.model.y1_xy *= (1. + f * ymean_relerr)
+
+                # sanity checks to make sure values make sense, and give up if needed
+                if getattr(self.model, adjust_qty) < 0. and self.outer_iteration > 20:
+                    raise ToFAdjustError(f'model wants {adjust_qty}={getattr(self.model, adjust_qty)} < 0.')
+                elif getattr(self.model, adjust_qty) > 1.:
+                    if self.outer_iteration < 20:
+                        # early in iterations; ease toward unity in case a good solution is in there somewhere
+                        setattr(self.model, adjust_qty, 0.5 *(self.c_prev[-1] + 1.))
+                    else:
+                        raise ToFAdjustError(f'model wants {adjust_qty}={getattr(self.model, adjust_qty)} > 1. model might have an unrealistically low total z content.')
+                elif getattr(self.model, adjust_qty) < 0.:
+                    # don't let it go negative, ease it toward zero in hopes that a converged model exists with this quantity non-negative
+                    setattr(self.model, adjust_qty, 0.5 * self.c_prev[-1])
+
                 if self.model.y1_xy < 0. and self.outer_iteration > 20:
-                    raise ToFAdjustError(f'cosine_yz wants y1_xy={self.model.y1_xy} < 0.')
+                    raise ToFAdjustError(f'model wants y1_xy={self.model.y1_xy} < 0.')
                 elif self.model.y1_xy < 0.:
                     self.model.y1_xy = 0.5 * self.y1_xy_prev[-1]
-                elif self.model.y1_xy < 1e-2 and self.outer_iteration > 20:
-                    raise ToFAdjustError(f'cosine_yz wants y1_xy < 0.01')
-                    
-                self.adjust_cosine_yz()
+                # elif self.model.y1_xy < 2e-2 and self.outer_iteration > 20:
+                    # raise ToFAdjustError(f'model wants y1_xy < 1e-2 after 20 iterations; convergence is unlikely')
+
+                self.adjust() # enforce composition profile for current global parameters, query eos, integrate temperatures
 
                 if 'debug_adjust' in self.params and self.params['debug_adjust']:
                     import pickle
-                    debug = {'y_xy':self.model.y_xy, 'mean_y_xy':self.model.mean_y_xy, 'y1_xy':self.model.y1_xy, 'm':self.m_calc, 'c':self.model.c, 'mtot_calc':self.mtot_calc}
+                    debug = {'y_xy':self.model.y_xy, 'ymean_xy':self.model.ymean_xy, 'y1_xy':self.model.y1_xy, 'z':self.model.z, 'm':self.m_calc, adjust_qty:getattr(self.model, adjust_qty), 'mtot_calc':self.mtot_calc}
                     pickle.dump(debug, open(f'debug_{self.outer_iteration:02n}.pkl', 'wb'))
-                
+
             else:
                 raise ValueError('model_type {} not recognized'.format(self.params['model_type']))
 
@@ -475,51 +564,73 @@ class tof4:
 
             # bookkeeping and collecting things for real-time output
             self.et_total = time.time() - time_start_outer
+            adjust_output = {}
             if self.params['model_type'] == 'three_layer':
                 adjust_output = {
                     'mcore':self.model.mcore,
                     'y1':self.model.y1,
                     'y2':self.model.y2,
-                    'mean_y_xy':self.model.mean_y_xy if hasattr(self.model, 'mean_y_xy') else -1,
+                    'ymean_xy':self.model.ymean_xy if hasattr(self.model, 'ymean_xy') else -1,
                     }
-            elif self.params['model_type'] == 'cosine_yz' or self.params['model_type'] == 'linear_yz':
+            elif self.params['model_type'] == 'continuous':
                 adjust_output = {
-                    'c':self.model.c,
+                    # 'c':self.model.c,
                     'y1_xy':self.model.y1_xy if hasattr(self.model, 'y1_xy') else -1,
-                    'mean_y_xy':self.model.mean_y_xy if hasattr(self.model, 'mean_y_xy') else -1,
+                    'ymean_xy':self.model.ymean_xy if hasattr(self.model, 'ymean_xy') else -1,
                     }
-            elif self.params['model_type'] == 'cosine_yz_c':
-                adjust_output = {
-                    'z2':self.model.z2,
-                    'y1_xy':self.model.y1_xy if hasattr(self.model, 'y1_xy') else -1,
-                    'mean_y_xy':self.model.mean_y_xy if hasattr(self.model, 'mean_y_xy') else -1,
-                    }
-            elif 'dual_cavity' in self.params['model_type']:
-                adjust_output = {
-                    'r1':self.model.r1,
-                    'r2':self.model.r2,
-                    'r3':self.model.r3,
-                    'y1':self.model.y1 if hasattr(self.model, 'y1') else -1,
-                    'y1_xy':self.model.y1_xy if hasattr(self.model, 'y1_xy') else -1,
-                    'mean_y_xy':self.model.mean_y_xy if hasattr(self.model, 'mean_y_xy') else -1,
-                    }
+                # if hasattr(self.model, 'c2'):
+                #     adjust_output['c2'] = self.model.c2
+                # elif hasattr(self.model, 'c'):
+                #     adjust_output['c'] = self.model.c
+                # elif hasattr(self.model, 'rstab'):
+                #     adjust_output['z1'] = self.model.z1
+                # else:
+                #     raise ValueError('unclear what quantity will be adjusted to satisfy total mass.')
+                adjust_output[adjust_qty] = getattr(self.model, adjust_qty)
             else:
-                # etc etc
-                pass
+                raise ValueError(f"model_type {self.params['model_type']} not recognized")
+
             if self.verbosity > 1 or (self.outer_iteration == 0 and self.verbosity > 0):
-                names = 'iout', 'iin', 'rhobar', 'mtot_calc', \
-                    *list(adjust_output), \
-                    'z2', 'z1', 'nz', \
-                    'et_total', 'j2', 'j4', 'j6', 'req', 'rm', 'rpol', 'small'
-                print (('%5s ' * 2 + '%11s ' * (len(names) - 2)) % names)
+                # names = 'iout', 'iin', 'nz', 'rhobar', \
+                #     # 'mtot_calc', \
+                #     'dmtot', \
+                #     *list(adjust_output), \
+                #     'z2', 'z1', \
+                #     'et_total', 'j2', 'j4', 'j6', 'req', 'rm', 'rpol', 'small'
+                # print (('%5s ' * 2 + '%11s ' * (len(names) - 2)) % names)
+                print(f"{'iout':>5}", end=' ')
+                print(f"{'iin':>5}", end=' ')
+                print(f"{'nz':>7}", end=' ')
+                for name in 'rhobar', 'log_dmtot':
+                    print(f"{name:>11}", end=' ')
+                for key in adjust_output:
+                    print(f"{key:>11}", end=' ')
+                for name in 'z2', 'z1', 'et_tot', 'j2', 'j4', 'j6', 'req', 'rm', 'rpol', 'small':
+                    print(f"{name:>11}", end=' ')
+                print()
+
             if self.verbosity > 0:
-                data = self.outer_iteration, self.inner_iteration, self.rhobar, \
-                        self.mtot_calc, \
-                        *[adjust_output[key] for key in list(adjust_output)], \
-                        self.model.z2 if hasattr(self.model, 'z2') else -1, \
-                        self.model.z1, self.nz, \
-                        self.et_total, self.j2, self.j4, self.j6, self.r_eq[-1], self.rm, self.r_pol[-1], self.small,
-                print (('%5i ' * 2 + '%11.5g ' * (len(data) - 2)) % data)
+                # data = self.outer_iteration, self.inner_iteration, self.rhobar, \
+                #         # self.mtot_calc / self.mtot, \
+                #         np.log10(np.abs(1. - self.mtot_calc / self.mtot)), \
+                #         *[adjust_output[key] for key in list(adjust_output)], \
+                #         self.model.z2 if hasattr(self.model, 'z2') else -1, \
+                #         self.model.z1, self.nz, \
+                #         ,
+                # print (('%5i ' * 2 + '%11.5g ' * (len(data) - 2)) % data)
+                print(f'{self.outer_iteration:5}', end=' ')
+                print(f'{self.inner_iteration:5}', end=' ')
+                print(f'{self.nz:7}', end=' ')
+                print(f'{self.rhobar:11.5g}', end=' ')
+                print(f'{np.log10(np.abs(1. - self.mtot_calc / self.mtot)):11.2e}', end=' ')
+                for key, val in adjust_output.items():
+                    print(f'{val:11.5g}', end=' ')
+                print(f"{self.model.z2 if hasattr(self.model, 'z2') else -1:11.5g}", end=' ')
+                print(f'{self.model.z1:11.5g}', end=' ')
+                for val in self.et_total, self.j2, self.j4, self.j6, self.r_eq[-1], self.rm, self.r_pol[-1], self.small:
+                    print(f'{val:11.5e}', end=' ')
+                print()
+
                 if 'debug_outer' in list(self.params) and self.params['debug_outer']:
                     import pickle
                     with open('debug_{:03n}.pkl'.format(self.outer_iteration), 'wb') as fout:
@@ -534,7 +645,7 @@ class tof4:
             self.rm_old = self.rm
             self.rm = self.l[-1]
 
-            if 'adjust_small' in list(self.params) and self.params['adjust_small']:
+            if self.adjust_small:
                 # originally small assumed saturn's true mtot and rm; scale small to reflect that
                 # original rotation rate but at the present model mtot and rm.
                 self.small = self.small_start * (self.rm / const.rsat) ** 3
@@ -547,20 +658,25 @@ class tof4:
             if self.outer_iteration > 10:
                 # if change in all j2n since last outer iteration is within tolerance,
                 # there's nothing to be gained from adjusting the mass distribution--we're done.
+                # print(self.j2n_rtol, (self.j2n_last_outer - self.j2n) / (self.j2n+1e-20))
+                # print(self.mtot_rtol, abs(self.mtot_calc - self.mtot) / self.mtot)
+                # print(self.ymean_rtol, abs(self.model.ymean_xy - self.params['ymean_xy']) / self.params['ymean_xy'])
                 if np.all(abs((self.j2n_last_outer - self.j2n) / (self.j2n+1e-20)) < self.j2n_rtol) \
                     and self.outer_iteration > 10 \
                     and self.inner_done \
                     and abs(self.mtot_calc - self.mtot) / self.mtot < self.mtot_rtol \
-                    and abs(self.model.mean_y_xy - self.params['mean_y_xy']) / self.params['mean_y_xy'] < self.ymean_rtol:
+                    and abs(self.model.ymean_xy - self.params['ymean_xy']) / self.params['ymean_xy'] < self.ymean_rtol:
 
                     if self.verbosity >= 3.:
                         print ('terminate outer loop; all dj2n/j2n < %g.' % self.j2n_rtol)
 
                     self.outer_done = True
 
-                    self.set_s2n(force_full=True)
+                    t0 = time.time()
+                    self.set_s2n(force_full=False) # this is actually slow if force_full==True; effect on final shape functions appears negligible
+                    # if self.verbosity > 0: print(f'final set_s2n completed in {time.time()-t0} s')
 
-                    self.save_model_summary()
+                    self.save_model() # calculate auxiliary quantities of interest and write the thing to disk
 
                     break
 
@@ -569,11 +685,9 @@ class tof4:
         return
 
     def adjust_three_layer(self):
-        '''
-        enforce new mcore, set y and z, reintegrate *adiabatic* t profile, and recalculate densities.
+        '''enforce new mcore, set y and z, reintegrate *adiabatic* t profile, and recalculate densities.
         this will not in general conserve the total mass of the model; the outer loop itself handles this by
-        comparing mtot to mtot_calc and telling this routine what mcore to set.
-        '''
+        comparing mtot to mtot_calc and telling this routine what mcore to set.'''
 
         old_mcore = self.model.old_mcore = self.model.mcore
         self.model.old_kcore = self.model.kcore
@@ -620,13 +734,42 @@ class tof4:
         self.model.z = z
 
         self.model.y[:kcore] = 0.
-        if hasattr(self.model, 'y2'):
-            self.model.y[kcore:ktrans] = self.model.y2
-            self.model.y[ktrans:] = self.model.y1
-        else: # first outer iteration
-            self.model.y[kcore:] = self.model.y1
-        
-        y = self.model.y
+        self.model.y[kcore:] = self.tof_params['y1'] # 0.27
+        # y = self.model.equilibrium_y_profile({'phase_t_offset':self.tof_params['phase_t_offset']})
+        # for the ToF calculation hold y1 fixed instead of phase_t_offset
+        if 'rainout_y1' in list(self.tof_params) and self.tof_params['rainout_y1'] is not None:
+            assert not hasattr(self.model, 'y2')
+            # y = self.model.y
+            y = self.model.equilibrium_y_profile_y1(self.tof_params['rainout_y1'])
+        elif 'dt' in list(self.tof_params):
+            # if not hasattr(self.model, 'mhe'): self.model.mhe = np.dot(self.model.y[kcore:], self.model.dm[kcore:])
+            menv = self.mtot_calc - self.model.mcore * const.mearth
+            # self.model.mhe = self.tof_params['ym'] * menv
+            if not hasattr(self.model, 'mhe'):
+                self.model.mhe = 0.27 * menv
+            self.model.ym = self.model.mhe / menv # current mean envelope helium abundance
+            # print('before rainout: mhe = {} me; envelope ym = {}'.format(self.model.mhe / const.mearth, self.model.ym))
+            y = self.model.equilibrium_y_profile(self.tof_params['dt'])
+            self.model.y = y
+            # print(' after rainout: mhe = {} me; envelope ym = {}'.format(np.dot(self.model.dm, self.model.y) / const.mearth, np.dot(self.model.dm, self.model.y) / menv))
+            # print(np.dot(self.model.dm, y) / (self.mtot_calc - self.model.mcore)) # current mean envelope helium abundance
+            self.model.y1 = y[-1]
+            self.model.y1_xy = y[-1] / (1. - self.model.z[-1])
+        elif 'hhe_phase_diagram' not in list(self.evol_params) or self.evol_params['hhe_phase_diagram'] is None:
+            # no phase diagram defined
+            if hasattr(self.model, 'y2') and self.model.y2:
+                # doing three-layer y
+                y[kcore:ktrans] = self.model.y2
+                self.model.y1 = self.tof_params['y1']
+                y[ktrans:] = self.model.y1
+            else:
+                # either doing single envelope y, or doing three-layer but self.adjust hasnt been called yet
+                # whole envelope has y=ym
+                # self.model.y1 = self.model.ym
+                self.model.y2 = self.model.ym
+                y[kcore:] = self.model.ym
+        else:
+            y = self.model.y
         assert not np.any(y[kcore:] == 0)
         # self.model.k_shell_top now set; compare to ptrans
 
@@ -637,7 +780,7 @@ class tof4:
             assert not np.any(np.isnan(t)), 'nans in t during adjust mcore, before t integration'
             assert not np.any(np.isnan(self.model.grada)), 'nans in grada during adjust mcore, before t integration'
         except AssertionError as e:
-            raise ongp.EOSError(e.args[0])
+            raise EOSError(e.args[0])
 
         self.model.gradt[kcore:] = self.model.grada[kcore:] \
             = self.model.hhe_eos.get_grada(np.log10(self.p[kcore:]), np.log10(self.model.t[kcore:]), y[kcore:])
@@ -647,8 +790,17 @@ class tof4:
         if np.any(np.isnan(self.model.grada)):
             raise ValueError('nans in grada: y1={} y2={} z1={} z2={}'.format(self.model.y1, self.model.y2, self.model.z1, self.model.z2))
 
-        t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
-        t *= self.model.t1
+        if 'alternate_t_integral' in list(self.tof_params) and self.tof_params['alternate_t_integral']:
+            # integrate on alternate pressure grid to improve accuracy
+            from scipy.interpolate import interp1d
+            p_grid = np.logspace(6, np.log10(self.p[0]), len(self.p))[::-1]
+            grada_grid = interp1d(self.p, self.model.grada, fill_value='extrapolate', kind='cubic')(p_grid)
+            t = np.exp(cumtrapz(grada_grid[::-1] / p_grid[::-1], x=p_grid[::-1], initial=0.))[::-1]
+            t *= self.model.t1
+            t = interp1d(p_grid, t, fill_value='extrapolate', kind='cubic')(self.p)
+        else:
+            t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
+            t *= self.model.t1
 
         self.rho[:kcore] = self.model.get_rho_z(np.log10(self.p[:kcore]), np.log10(t[:kcore]))
         self.rho[kcore:] = self.model.get_rho_xyz(np.log10(self.p[kcore:]), np.log10(t[kcore:]), y[kcore:], z[kcore:])
@@ -659,58 +811,88 @@ class tof4:
 
         self.model.mhe = np.dot(self.model.dm, self.model.y)
         self.model.mz = np.dot(self.model.dm, self.model.z)
-        self.model.mean_y_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
+        self.model.ymean_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
         self.model.ym = self.model.mhe / self.mtot_calc # current actual M_He / M_tot
 
-        if 'ym' in list(self.params):
-            assert 'mean_y_xy' not in list(self.params), 'must specify only one of ym and mean_y_xy in tof_params.'
-            relative_mismatch = (self.params['ym'] - self.model.ym) / self.params['ym']
-        elif 'mean_y_xy' in list(self.params):
-            relative_mismatch = (self.params['mean_y_xy'] - self.model.mean_y_xy) / self.params['mean_y_xy']
-        else:
-            raise ValueError('no rule to adjust helium mass fraction; must set either ym or mean_y_xy.')
         # adjust y2 to approach correct ymean
+        relative_mismatch = (self.params['ymean_xy'] - self.model.ymean_xy) / self.params['ymean_xy']
         if not hasattr(self.model, 'y2'): self.model.y2 = self.model.y1
         self.model.y2 *= (1. + relative_mismatch)
+        if self.model.y2 < 0: raise ToFAdjustError('got y2<0 trying to adjust y2')
 
         return
 
-    def adjust_linear_yz(self):
-        
+    def adjust(self):
         '''
-        similar but for a model with continuous Y and Z distributions. 
-        Z and Y_XY each increase linearly from r/R = c+w/2 down to c-w/2.
+        for current pressure-mass-radius profile, enforce composition profiles corresponding to the user-supplied composition params.
+        then do an eos call and integrate to get temperature profile, and update the densities.
+        this version is similar to the original, adjust_three_layer, but for a model with continuous Y and Z distributions.
+        here Z and Y_XY each increase sinusoidally or linearly from r/R = c+w/2 down to c-w/2.
         '''
-
-        old_c = self.model.old_c = self.model.c
-        c = self.model.c = self.new_c
-
-        kcore = 0
 
         if np.any(np.diff(self.l) <= 0.):
             raise ValueError('radius not monotone increasing')
 
-        w = self.model.w
+        rf = self.l / self.l[-1] # fractional radius
 
-        # this time y gradient (y1_xy to y2_xy) coincides exactly with z gradient (z1 to z2)
-        rf = self.l / self.l[-1]
+        if hasattr(self.model, 'c2') or hasattr(self.model, 'c'):
+            # get desired centroids and widths for z and y cavities; for standard single-cavity model these are the same
+            # after the big fix to the eos call (feb 2021) these perform less well when sampling; the 'rstab' and 'rstab_in' scheme works better
+            cz = self.model.c2 if hasattr(self.model, 'c2') else self.model.c
+            cy = self.model.c1 if hasattr(self.model, 'c1') else self.model.c
+            wz = self.model.w2 if hasattr(self.model, 'w2') else self.model.w
+            wy = self.model.w1 if hasattr(self.model, 'w1') else self.model.w
+        else:
+            if hasattr(self.model, 'rstab_in'):
+                # using alternate parameterization with stable region from r=rstab_in to r=rstab
+                rstab_in = self.model.rstab_in
+                rstab = self.model.rstab
+                cz = cy = 0.5 * (self.model.rstab_in + self.model.rstab)
+                wz = wy = self.model.rstab - self.model.rstab_in
+            else:
+                # using alternate parameterization with stable region from r=0 to r=rstab
+                rstab = self.model.rstab
+                cz = cy = 0.5 * rstab
+                wz = wy = rstab
 
-        self.model.z = self.model.z1 + (self.model.z2 - self.model.z1) * (0.5 + (c - rf) / w)
-        self.model.z[rf < c - w / 2] = self.model.z2
-        self.model.z[rf > c + w / 2] = self.model.z1
-        z = self.model.z
+        if self.params['gradient_shape'] == 'sigmoid':
+            self.model.z = self.model.z1 + (self.model.z2 - self.model.z1) * 0.5 * (1. + np.cos(np.pi * (cz - rf - wz / 2) / wz))
+            self.model.z[rf < cz - wz / 2] = self.model.z2
+            self.model.z[rf > cz + wz / 2] = self.model.z1
+        elif self.params['gradient_shape'] == 'linear':
+            self.model.z = self.model.z1 + (self.model.z2 - self.model.z1) * (0.5 + (cz - rf) / wz)
+            self.model.z[rf < cz - wz / 2] = self.model.z2
+            self.model.z[rf > cz + wz / 2] = self.model.z1
+        else:
+            raise ValueError(f"gradient_shape {self.params['gradient_shape']} not recognized")
 
         if self.model.y2_xy is None:
             y_xy = self.model.y1_xy * np.ones_like(rf)
         else:
-            y_xy = self.model.y1_xy + (self.model.y2_xy - self.model.y1_xy) * (0.5 + (c - rf) / w)
-            y_xy[rf < c - w / 2] = self.model.y2_xy
-            y_xy[rf > c + w / 2] = self.model.y1_xy
-        self.model.y = y = y_xy * (1. - z)
-        self.model.y[self.model.y == 0.] = 1e-20 # keeps mixture eos evaluable
+            if self.params['gradient_shape'] == 'sigmoid':
+                self.model.y_xy = self.model.y1_xy + (self.model.y2_xy - self.model.y1_xy) * 0.5 * (1. + np.cos(np.pi * (cy - rf - wy / 2) / wy))
+                self.model.y_xy[rf < cy - wy / 2] = self.model.y2_xy
+                self.model.y_xy[rf > cy + wy / 2] = self.model.y1_xy
+            elif self.params['gradient_shape'] == 'linear':
+                self.model.y_xy = self.model.y1_xy + (self.model.y2_xy - self.model.y1_xy) * (0.5 + (cy - rf) / wy)
+                self.model.y_xy[rf < cy - wy / 2] = self.model.y2_xy
+                self.model.y_xy[rf > cy + wy / 2] = self.model.y1_xy
+            else:
+                raise ValueError(f"gradient_shape {self.params['gradient_shape']} not recognized")
 
-        assert np.all(self.model.y >= 0)
-        assert np.all(self.model.y < 1)
+            y_xy = self.model.y1_xy + (self.model.y2_xy - self.model.y1_xy) * 0.5 * (1. + np.cos(np.pi * (cy - rf - wy / 2) / wy))
+            y_xy[rf < cy - wy / 2] = self.model.y2_xy
+            y_xy[rf > cy + wy / 2] = self.model.y1_xy
+
+        self.model.y_xy[self.model.y_xy == 0.] = 1e-20 # keeps mixture eos evaluable
+        self.model.y = self.model.y_xy * (1. - self.model.z)
+
+        # import pickle
+        # with open('debug.pkl', 'wb') as f:
+        #     pickle.dump({'r':self.l, 'z':z, 'y_xy':y_xy}, f)
+
+        assert np.all(self.model.y_xy > 0)
+        assert np.all(self.model.y_xy < 1)
 
         if np.any(np.isnan(self.model.grada)):
             print('nans in grada: y1={} y2={} z1={} z2={}'.format(self.model.y1, self.model.y2, self.model.z1, self.model.z2))
@@ -721,70 +903,54 @@ class tof4:
             assert not np.any(np.isnan(self.model.t)), 'nans in t during adjust mcore, before t integration'
             assert not np.any(np.isnan(self.model.grada)), 'nans in grada during adjust mcore, before t integration'
         except AssertionError as e:
-            raise ongp.EOSError(e.args[0])
+            raise EOSError(e.args[0])
 
-        if 'rrho_in_composition_gradient' in self.params and self.params['rrho_in_composition_gradient']:
-            # get grady, gradz, dlnrho/dlny, dlnrho/dlnz, set gradt > grada
-            hhe_eos = self.model.hhe_eos
-            z_eos = self.model.z_eos
-            rho = self.rho
+        # hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), y)
+        hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.y_xy) # was previously y ;(
+        z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.f_ice)
 
-            # call eos for new quantities not saved from tof
-            hhe_res = hhe_eos.get(np.log10(self.p), np.log10(self.model.t), y)
-            # assert self.model.z_eos_option == 'reos water'
-            if self.model.z_eos_option == 'reos water':
-                import reos_water_rhot
-                z_eos_rhot = reos_water_rhot.eos()
-            elif self.model.z_eos_option.split()[0] == 'aneos':
-                import aneos_rhot
-                z_eos_rhot = aneos_rhot.eos(self.model.z_eos_option.split()[1])
-            else:
-                raise ValueError('good z eos derivs only implemented for reos water or aneos.')
-            z_res = z_eos_rhot.get(np.log10(rho), np.log10(self.model.t))
+        # update densities
+        rho_z = 10 ** z_res['logrho']
+        rho_hhe = 10 ** hhe_res['logrho']
+        rhoinv = self.model.z / rho_z + (1. - self.model.z) / rho_hhe
+        self.rho[:] = rhoinv[:] ** -1.
 
-            rho_hhe = 10 ** hhe_res['logrho']
-            rho_h = hhe_res['rho_h']
-            rho_he = hhe_res['rho_he']
-            assert not np.any(z <= 0)
-            rho_z = z * rho * rho_hhe / (rho_hhe - rho * (1. - z))
-            chi_z = rho * z * (1. / rho_hhe - 1. / rho_z) # chi_z is a bad name, this is actually dlnrho_dlnz_const_pty
-            chi_y = rho * y * (1. - z) * (1. / rho_h - 1. / rho_he) # dlnrho_dlny_const_ptz
+        self.model.grada = hhe_res['grada']
 
-            chi_rho_hhe = hhe_res['chirho']
-            chi_rho_z = z_res['chirho']
+        if 'superad' in self.params and self.params['superad']:
+            gradyp = np.gradient(np.log(self.model.y_xy)) / np.gradient(np.log(self.p))
+            gradz = np.gradient(np.log(self.model.z)) / np.gradient(np.log(self.p))
+            # these are both positive by construction for our model; just look at sum to decide which regions are stable
+            self.model.gradt = self.model.grada + self.params['superad'] * np.sign(gradyp + gradz)
+        else:
+            # un_grav repo gets grada this way:
+            # rhot = self.rho / rho_z * z * z_res['rhot'] + self.rho / rho_hhe * (1. - z) * hhe_res['rhot']
+            # delta = -rhot
+            # cp = z * z_res['cp'] + (1. - z) * hhe_res['cp']
+            # self.model.grada = self.p * delta / self.model.t / self.rho / cp
 
-            if self.model.z_eos_option.split()[0] == 'aneos':
-                # ignore the z part of chi_t and chi_rho
-                chi_rho = chi_rho_hhe
-                chi_t = - hhe_res['rhot'] / hhe_res['rhop']
-                dlnrho_dlnt_const_p = - hhe_res['rhot']
-            else:
-                if False:
-                    chi_rho = (z * rho / rho_z / chi_rho_z + (1. - z) * rho / rho_hhe / chi_rho_hhe) ** -1.
+            self.model.gradt = self.model.grada
 
-                    dlnrho_dlnt_const_p = z * rho / rho_z * z_res['rhot'] + (1. - z) * rho / rho_he * hhe_res['rhot']
-                    dlnrho_dlnp_const_t = z * rho / rho_z * z_res['rhop'] + (1. - z) * rho / rho_he * hhe_res['rhop']
-                    chi_t = - dlnrho_dlnt_const_p / dlnrho_dlnp_const_t
-                else:
-                    chi_rho = chi_rho_hhe
-                    chi_t = - hhe_res['rhot'] / hhe_res['rhop']
+        # use linear interpolant for fast evaluations of gradt at arbitrary pressures.
+        # allow it to extrapolate just because, for whatever reason, solve_ivp is passing pressures
+        # barely larger (0.1 ppm) than the central pressure in rare cases.
+        interp_gradt = interp1d(self.p, self.model.gradt, fill_value='extrapolate')
+        def dtdp(p, t):
+            # print(f'{p:e} {self.p[0]:e} {self.p[0]-p:e}')
+            return t / p * interp_gradt(p)
+        p_eval = self.p[::-1] # integrate from surface to center
+        # sanity checks
+        assert not np.any(np.isnan(self.p))
+        assert not np.any(self.p[1:] > self.p[0])
+        assert not np.any(self.p[:-1] < self.p[-1])
+        assert self.p[-1] == 1e6
+        assert interp_gradt(p_eval[0])
+        assert interp_gradt(p_eval[-1])
+        # integrate grada to get t profile
+        sol = solve_ivp(dtdp, (p_eval[0], p_eval[-1]), np.array([self.model.t1]), t_eval=p_eval)
+        assert sol.success, 'failed in integrate_temperature'
+        self.model.t = sol.y[0][::-1]
 
-            grady = np.diff(np.log(y), append=0) / np.diff(np.log(self.p), append=0)
-            gradz = np.diff(np.log(z), append=0) / np.diff(np.log(self.p), append=0)
-            self.model.brunt_b = b = chi_rho / chi_t * (chi_y * grady + chi_z * gradz)
-            self.model.grada = hhe_res['grada']
-            self.model.gradt = self.model.grada + self.model.brunt_b * self.params['rrho_in_composition_gradient']
-
-            t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
-            t *= self.model.t1
-            self.model.t = t
-        else: # simply assume gradt = grada and integrate
-            self.model.gradt = self.model.grada = self.model.hhe_eos.get_grada(np.log10(self.p), np.log10(self.model.t), y)
-            t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
-            t *= self.model.t1
-            self.model.t = t
-
-        self.rho = self.model.get_rho_xyz(np.log10(self.p), np.log10(self.model.t), self.model.y, self.model.z)
 
         if np.any(np.isnan(self.rho)):
             raise ToFAdjustError('nans in rho during adjust; possibly off eos tables')
@@ -792,157 +958,12 @@ class tof4:
             print('logt where rho==nan', np.log10(self.model.t[np.isnan(self.rho)]))
             print('chi_rho where rho==nan', chi_rho[np.isnan(self.rho)])
             print('chi_t where rho==nan', chi_t[np.isnan(self.rho)])
-            print('chi_y where rho==nan', chi_y[np.isnan(self.rho)])
-            print('chi_z where rho==nan', chi_z[np.isnan(self.rho)])
             print('grady where rho==nan', grady[np.isnan(self.rho)])
             print('gradz where rho==nan', gradz[np.isnan(self.rho)])
             print('z where rho==nan', self.model.z[np.isnan(self.rho)])
             print('y where rho==nan', self.model.y[np.isnan(self.rho)])
             print('z where rho==nan', self.model.z[np.isnan(self.rho)])
 
-        self.model.mhe = np.dot(self.dm, self.model.y)
-        self.model.mz = np.dot(self.dm, self.model.z)
-        self.model.mean_y_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
-        self.model.ym = self.model.mhe / self.mtot_calc # current actual M_He / M_tot
-
-        if 'ym' in list(self.params):
-            relative_mismatch = (self.params['ym'] - self.model.ym) / self.params['ym']
-        elif 'mean_y_xy' in list(self.params):
-            relative_mismatch = (self.params['mean_y_xy'] - self.model.mean_y_xy) / self.params['mean_y_xy']
-
-        f = 0.5 if self.outer_iteration > 20 else 1.
-        # self.model.dboty *= (1. + f * relative_mismatch)
-        # adjust outer envelope helium abundance to approach plausible mean abundance
-        self.model.y1_xy *= (1. + f * relative_mismatch)
-
-        # print(self.model.mean_y_xy, self.params['mean_y_xy'], relative_mismatch, self.model.dboty)
-
-        return
-
-    def adjust_cosine_yz(self):
-        '''
-        similar but for a model with continuous Y and Z distributions. 
-        Z and Y_XY each increase sinusoidally from r/R = c+w/2 down to c-w/2.
-        '''
-
-        if np.any(np.diff(self.l) <= 0.):
-            raise ValueError('radius not monotone increasing')
-
-        c = self.model.c
-        w = self.model.w
-
-        # this time y gradient (y1_xy to y2_xy) coincides exactly with z gradient (z1 to z2)
-        rf = self.l / self.l[-1]
-
-        self.model.z = self.model.z1 + (self.model.z2 - self.model.z1) * 0.5 * (1. + np.cos(np.pi * (c - rf - w/2) / w))
-        self.model.z[rf < c - w / 2] = self.model.z2
-        self.model.z[rf > c + w / 2] = self.model.z1
-        z = self.model.z
-
-        if self.model.y2_xy is None:
-            y_xy = self.model.y1_xy * np.ones_like(rf)
-        else:
-            y_xy = self.model.y1_xy + (self.model.y2_xy - self.model.y1_xy) * 0.5 * (1. + np.cos(np.pi * (c - rf - w/2) / w))
-            y_xy[rf < c - w / 2] = self.model.y2_xy
-            y_xy[rf > c + w / 2] = self.model.y1_xy
-        self.model.y = y = y_xy * (1. - z)
-        self.model.y_xy = y_xy
-        self.model.y[self.model.y == 0.] = 1e-20 # keeps mixture eos evaluable
-
-        assert np.all(self.model.y >= 0)
-        assert np.all(self.model.y < 1)
-
-        if np.any(np.isnan(self.model.grada)):
-            print('nans in grada: y1={} y2={} z1={} z2={}'.format(self.model.y1, self.model.y2, self.model.z1, self.model.z2))
-            raise ValueError
-
-        try:
-            assert not np.any(np.isnan(self.p)), 'nans in p during adjust mcore, before t integration'
-            assert not np.any(np.isnan(self.model.t)), 'nans in t during adjust mcore, before t integration'
-            assert not np.any(np.isnan(self.model.grada)), 'nans in grada during adjust mcore, before t integration'
-        except AssertionError as e:
-            raise ongp.EOSError(e.args[0])
-
-        if 'rrho_in_composition_gradient' in self.params and self.params['rrho_in_composition_gradient']:
-            # get grady, gradz, dlnrho/dlny, dlnrho/dlnz, set gradt > grada
-            hhe_eos = self.model.hhe_eos
-            z_eos = self.model.z_eos
-            rho = self.rho
-
-            # new quantities not saved from tof
-            hhe_res = hhe_eos.get(np.log10(self.p), np.log10(self.model.t), y)
-            # assert self.model.z_eos_option == 'reos water'
-            if self.model.z_eos_option == 'reos water':
-                import reos_water_rhot
-                z_eos_rhot = reos_water_rhot.eos()
-            elif self.model.z_eos_option.split()[0] == 'aneos':
-                import aneos_rhot
-                z_eos_rhot = aneos_rhot.eos(self.model.z_eos_option.split()[1])
-            else:
-                raise ValueError('good z eos derivs only implemented for reos water or aneos.')
-            z_res = z_eos_rhot.get(np.log10(rho), np.log10(self.model.t))
-
-            rho_hhe = 10 ** hhe_res['logrho']
-            rho_h = hhe_res['rho_h']
-            rho_he = hhe_res['rho_he']
-            assert not np.any(z <= 0)
-            rho_z = z * rho * rho_hhe / (rho_hhe - rho * (1. - z))
-            chi_z = rho * z * (1. / rho_hhe - 1. / rho_z) # chi_z is a bad name, this is actually dlnrho_dlnz_const_pty
-            chi_y = rho * y * (1. - z) * (1. / rho_h - 1. / rho_he) # dlnrho_dlny_const_ptz
-
-            chi_rho_hhe = hhe_res['chirho']
-            chi_rho_z = z_res['chirho']
-
-            if self.model.z_eos_option.split()[0] == 'aneos':
-                # ignore the z part of chi_t and chi_rho
-                chi_rho = chi_rho_hhe
-                chi_t = - hhe_res['rhot'] / hhe_res['rhop']
-                dlnrho_dlnt_const_p = - hhe_res['rhot']
-            else:
-                if False:
-                    chi_rho = (z * rho / rho_z / chi_rho_z + (1. - z) * rho / rho_hhe / chi_rho_hhe) ** -1.
-
-                    dlnrho_dlnt_const_p = z * rho / rho_z * z_res['rhot'] + (1. - z) * rho / rho_he * hhe_res['rhot']
-                    dlnrho_dlnp_const_t = z * rho / rho_z * z_res['rhop'] + (1. - z) * rho / rho_he * hhe_res['rhop']
-                    chi_t = - dlnrho_dlnt_const_p / dlnrho_dlnp_const_t
-                else:
-                    chi_rho = chi_rho_hhe
-                    chi_t = - hhe_res['rhot'] / hhe_res['rhop']
-
-            grady = np.diff(np.log(y), append=0) / np.diff(np.log(self.p), append=0)
-            gradz = np.diff(np.log(z), append=0) / np.diff(np.log(self.p), append=0)
-            self.model.brunt_b = b = chi_rho / chi_t * (chi_y * grady + chi_z * gradz)
-            self.model.grada = hhe_res['grada']
-            self.model.gradt = self.model.grada + self.model.brunt_b * self.params['rrho_in_composition_gradient']
-
-            t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
-            t *= self.model.t1
-            self.model.t = t
-        else:
-            try:
-                self.model.gradt = self.model.grada = self.model.hhe_eos.get_grada(np.log10(self.p), np.log10(self.model.t), y)
-            except:
-                raise ongp.EOSError('failed in eos call in adjust_cosine_yz')
-            t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
-            t *= self.model.t1
-            self.model.t = t
-
-        self.rho = self.model.get_rho_xyz(np.log10(self.p), np.log10(self.model.t), self.model.y, self.model.z)
-
-        if np.any(np.isnan(self.rho)):
-            raise ToFAdjustError('nans in rho during adjust; possibly off eos tables')
-            print('logp where rho==nan', np.log10(self.p[np.isnan(self.rho)]))
-            print('logt where rho==nan', np.log10(self.model.t[np.isnan(self.rho)]))
-            print('chi_rho where rho==nan', chi_rho[np.isnan(self.rho)])
-            print('chi_t where rho==nan', chi_t[np.isnan(self.rho)])
-            print('chi_y where rho==nan', chi_y[np.isnan(self.rho)])
-            print('chi_z where rho==nan', chi_z[np.isnan(self.rho)])
-            print('grady where rho==nan', grady[np.isnan(self.rho)])
-            print('gradz where rho==nan', gradz[np.isnan(self.rho)])
-            print('z where rho==nan', self.model.z[np.isnan(self.rho)])
-            print('y where rho==nan', self.model.y[np.isnan(self.rho)])
-            print('z where rho==nan', self.model.z[np.isnan(self.rho)])
-        
         return
 
     def add_point_to_figure_functions(self, k):
@@ -976,7 +997,7 @@ class tof4:
         self.ss6p = np.insert(self.ss6p, k, self.ss6p[k])
         self.ss8p = np.insert(self.ss8p, k, self.ss8p[k])
 
-    def save_model_summary(self):
+    def save_model(self):
         """saves tof parameter/scalar/vector data."""
         import pickle
 
@@ -1009,25 +1030,51 @@ class tof4:
 
         self.model.mhe = trapz(self.model.y, x=self.m_calc) # np.dot(self.dm, self.model.y)
         self.model.mz = trapz(self.model.z, x=self.m_calc) # np.dot(self.dm, self.model.z)
-        self.model.mean_y_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
+        self.model.ymean_xy = self.model.mhe / (self.mtot_calc - self.model.mz) # current actual M_He / (M_H + M_He)
         self.model.ym = self.model.mhe / self.mtot_calc # current actual M_He / M_tot
 
-        # esimates of core mass and core radius, written with a smooth model in mind;
-        # in the case of a three-layer model should reduce to the specified mcore
-        scalars['mcore_proxy'] = self.m_calc[self.model.z < 0.5][0]
-        scalars['rcore_proxy'] = self.l[self.model.z < 0.5][0]
-        mz = cumtrapz(self.model.z, x=self.m_calc, initial=0.)
-        try:
-            scalars['mz_in'] = mz[self.model.z > 0.5][-1]
-        except IndexError:
-            raise ToFAdjustError('no zone with Z>0.5')
-        scalars['mz_out'] = mz[-1] - scalars['mz_in']
-        my = cumtrapz(self.model.y, x=self.m_calc, initial=0.)
-        scalars['my_in'] = my[self.model.z > 0.5][-1]
-        scalars['my_out'] = my[-1] - scalars['my_in']
-        scalars['rhoc_proxy'] = self.rho[self.model.z < 0.5][0]
-        scalars['pc_proxy'] = self.p[self.model.z < 0.5][0]
-        scalars['tc_proxy'] = self.model.t[self.model.z < 0.5][0]
+        if False: # now our solutions include models with z_center < 0.5, so the old definition won't work
+            # esimates of core mass and core radius, written with a smooth model in mind;
+            # in the case of a three-layer model should reduce to the specified mcore
+            scalars['mcore_proxy'] = self.m_calc[self.model.z < 0.5][0]
+            scalars['rcore_proxy'] = self.l[self.model.z < 0.5][0]
+            mz = cumtrapz(self.model.z, x=self.m_calc, initial=0.)
+            try:
+                scalars['mz_in'] = mz[self.model.z > 0.5][-1]
+                scalars['mz_out'] = mz[-1] - scalars['mz_in']
+                my = cumtrapz(self.model.y, x=self.m_calc, initial=0.)
+                scalars['my_in'] = my[self.model.z > 0.5][-1]
+                scalars['my_out'] = my[-1] - scalars['my_in']
+                scalars['rhoc_proxy'] = self.rho[self.model.z < 0.5][0]
+                scalars['pc_proxy'] = self.p[self.model.z < 0.5][0]
+                scalars['tc_proxy'] = self.model.t[self.model.z < 0.5][0]
+            except IndexError:
+                # raise ToFAdjustError('no zone with Z>0.5')
+                scalars['mz_in'] = 0.
+                scalars['mz_out'] = 0.
+                scalars['my_in'] = 0.
+                scalars['my_out'] = 0.
+                scalars['rhoc_proxy'] = 0.
+                scalars['pc_proxy'] = 0.
+                scalars['tc_proxy'] = 0.
+        else:
+            # define "core mass" and "core radius" as mass and radius of the boundary containing 50% of the model's total heavy element mass
+            mz = cumtrapz(self.model.z, x=self.m_calc, initial=0.)
+            mzf = mz / mz[-1]
+            scalars['rcore_proxy'] = np.interp(0.5, mzf, self.l)
+            scalars['mcore_proxy'] = np.interp(0.5, mzf, self.m_calc)
+            scalars['mzcore_proxy'] = np.interp(0.5, mzf, mz)
+
+        if hasattr(self.model, 'rstab'):
+            scalars['mstab'] = np.interp(self.model.rstab, self.l / self.l[-1], self.m_calc)
+            scalars['mzstab'] = np.interp(self.model.rstab, self.l / self.l[-1], mz)
+        if hasattr(self.model, 'rstab_in'):
+            scalars['mcore_proxy_inner'] = np.interp(self.model.rstab_in, self.l / self.l[-1], self.m_calc)
+            scalars['mzcore_proxy_inner'] = np.interp(self.model.rstab_in, self.l / self.l[-1], mz)
+
+        scalars['rho_center'] = self.rho[0]
+        scalars['p_center'] = self.p[0]
+        scalars['t_center'] = self.model.t[0]
 
         # scalar quantities that self.model may or may not have set, depending on model type:
         model_scalar_names = 'mcore', 'y1', 'y2', 'ym', 'kcore', 'k_shell_top', 'ktrans', \
@@ -1038,26 +1085,25 @@ class tof4:
         self.scalars = scalars # save as attribute so that MCMC can use for likelihood
 
         output = {}
-        for attr in 'params', 'mesh_params':
-            output[attr] = getattr(self, attr)
-        output['scalars'] = scalars
+        output['params'] = self.params
+        output['scalars'] = self.scalars
 
-        # gather vector output
+        # add vector output
         vectors = {}
         vectors['l'] = l = self.l
+        vectors['lf'] = self.l / self.l[-1]
         vectors['req'] = self.r_eq
         vectors['rpol'] = self.r_pol
         vectors['rho'] = rho = self.rho
         vectors['p'] = p = self.p
-        # vectors['u'] = self.u # rarely care
+        # vectors['u'] = self.u # potential
         vectors['m_calc'] = m = self.m_calc
-        # was skipping these shape functions for a while # am skipping them again to save disk space
-        # vectors['s0'] = self.s0
-        # vectors['s2'] = self.s2
-        # vectors['s4'] = self.s4
-        # vectors['s6'] = self.s6
-        # vectors['s8'] = self.s8
-        #
+        # shape functions
+        vectors['s0'] = self.s0
+        vectors['s2'] = self.s2
+        vectors['s4'] = self.s4
+        vectors['s6'] = self.s6
+        vectors['s8'] = self.s8
         # vectors['ss0'] = self.ss0
         # vectors['ss2'] = self.ss2
         # vectors['ss4'] = self.ss4
@@ -1070,51 +1116,47 @@ class tof4:
         # and temperature
         vectors['t'] = t = self.model.t
         vectors['gradt'] = gradt = self.model.gradt
-        y[y == 0.] = 1e-10
+        y[y == 0.] = 1e-20
+        yp = y / (1. - z) # Y^\prime = Y/(X+Y)=Y/(1-Z); this is referred to as y_xy elsewhere in the code
 
         # both forms of brunt calculation will require eos quantities
         hhe_eos = self.model.hhe_eos
         z_eos = self.model.z_eos
-        # model = output # easily port following code from analyze_chains.ipynb
-
-        # new quantities not saved from tof
-        hhe_res = hhe_eos.get(np.log10(p), np.log10(t), y)
-        # assert self.model.z_eos_option == 'reos water'
-        if self.model.z_eos_option == 'reos water':
-            import reos_water_rhot
-            z_eos_rhot = reos_water_rhot.eos()
-            z_res = z_eos_rhot.get(np.log10(rho), np.log10(t))
-        elif self.model.z_eos_option.split()[0] == 'aneos':
-            if self.model.z_eos_option.split()[1] == 'mix':
-                pass # have implemented rhop, rhot, chirho, chit, but not gamma1/grada yet
-            else:
-                import aneos_rhot
-                z_eos_rhot = aneos_rhot.eos(self.model.z_eos_option.split()[1])
-                z_res = z_eos_rhot.get(np.log10(rho), np.log10(t))
-        else:
-            raise ValueError('good z eos derivs only implemented for reos water or aneos.')
+        hhe_res = hhe_eos.get(np.log10(p), np.log10(t), yp)
+        z_res = z_eos.get(np.log10(p), np.log10(t), self.model.f_ice)
 
         vectors['gamma1'] = hhe_res['gamma1']
         grada = vectors['grada'] = self.model.grada # hhe_res['grada']
         vectors['rhot'] = hhe_res['rhot']
         vectors['g'] = g = m / l ** 2 * const.cgrav
+        # vectors['geq'] = geq = m / self.r_eq ** 2 * const.cgrav
+        # vectors['gpol'] = gpol = m / self.r_pol ** 2 * const.cgrav
+        # vectors['entropy_hhe'] = 10 ** hhe_res['logs'] * const.mp / const.kb
 
-        vectors['dlnp_dr'] = np.diff(np.log(p), append=0) / np.diff(l, append=0)
-        vectors['dlnrho_dr'] = np.diff(np.log(rho), append=0) / np.diff(l, append=0)
+        # vectors['dlnp_dr'] = np.gradient(np.log(p)) / np.gradient(l)
+        # vectors['dlnrho_dr'] = np.gradient(np.log(rho)) / np.gradient(l)
 
-        vectors['n2_direct'] = g * (vectors['dlnp_dr'] / vectors['gamma1'] - vectors['dlnrho_dr'])
+        # vectors['n2_direct'] = g * (vectors['dlnp_dr'] / vectors['gamma1'] - vectors['dlnrho_dr'])
+        # vectors['n2eq_direct'] = geq * (vectors['dlnp_dr'] / vectors['gamma1'] - vectors['dlnrho_dr'])
+        # vectors['n2pol_direct'] = gpol * (vectors['dlnp_dr'] / vectors['gamma1'] - vectors['dlnrho_dr'])
 
-        rho_hhe = 10 ** hhe_res['logrho']
-        rho_h = hhe_res['rho_h']
-        rho_he = hhe_res['rho_he']
-        rho_z = z * rho * rho_hhe / (rho_hhe - rho * (1. - z))
-        chi_z = rho * z * (1. / rho_hhe - 1. / rho_z) # chi_z is a bad name, this is actually dlnrho_dlnz_const_pty
-        chi_y = rho * y * (1. - z) * (1. / rho_h - 1. / rho_he) # dlnrho_dlny_const_ptz
+        vectors['n2_direct'] = g ** 2 * rho / p * (np.gradient(np.log(rho)) / np.gradient(np.log(p)) - 1. / vectors['gamma1'])
+        vectors['n2eq_direct'] = (self.l / self.r_eq) ** 4 * vectors['n2_direct'] # geq/g = (l/req) ** 2; second power of 2 comes from g**2 in n2
+        vectors['n2pol_direct'] = (self.l / self.r_pol) ** 4 * vectors['n2_direct'] # gpol/g = (l/rpol) ** 2
+
+        vectors['rho_h'] = rho_h = hhe_res['rho_h']
+        vectors['rho_he'] = rho_he = hhe_res['rho_he']
+        vectors['rho_hhe'] = rho_hhe = 10 ** hhe_res['logrho']
+        vectors['rho_z'] = rho_z = 10 ** z_res['logrho']
+
+        dlnrho_dlnz = rho * z * (1. / rho_hhe - 1. / rho_z) # constant p, t, yp
+        dlnrho_dlnyp = rho * y * (1. / rho_h - 1. / rho_he) # constant p, t, z # equal to dlnrho_dlny since yp is proportional to y
 
         chi_rho_hhe = hhe_res['chirho']
 
-        if self.model.z_eos_option.split()[0] == 'aneos':
-            # ignore the z part of chi_t and chi_rho
+        if True:
+            # ignore the z part of chi_rho, chi_t - the compressibilities from z eos are a minor contribution and
+            # numerics in our aneos implementation can give unphysical zero crossings, so better to leave out
             chi_rho = chi_rho_hhe
             chi_t = - hhe_res['rhot'] / hhe_res['rhop']
             dlnrho_dlnt_const_p = - hhe_res['rhot']
@@ -1126,46 +1168,61 @@ class tof4:
             dlnrho_dlnp_const_t = z * rho / rho_z * z_res['rhop'] + (1. - z) * rho / rho_he * hhe_res['rhop']
             chi_t = - dlnrho_dlnt_const_p / dlnrho_dlnp_const_t
 
-        if self.params['model_type'] is not 'three_layer':
-            grady = np.diff(np.log(y), append=0) / np.diff(np.log(p), append=0)
-            gradz = np.diff(np.log(z), append=0) / np.diff(np.log(p), append=0)
-            vectors['brunt_b'] = b = chi_rho / chi_t * (chi_y * grady + chi_z * gradz)
+        if self.params['model_type'] == 'continuous':
+            vectors['gradyp'] = gradyp = np.gradient(np.log(yp)) / np.gradient(np.log(p))
+            vectors['gradz'] = gradz = np.gradient(np.log(z)) / np.gradient(np.log(p))
+            # vectors['brunt_b'] = b = chi_rho / chi_t * (dlnrho_dlny * grady + dlnrho_dlnz * gradz)
 
-            # more quantities for diagnostics; need not save in the long run
-            vectors['grady'] = grady
-            vectors['gradz'] = gradz
-            vectors['chi_y'] = chi_y
-            vectors['chi_z'] = chi_z
+            vectors['dlnrho_dlnyp'] = dlnrho_dlnyp
+            vectors['dlnrho_dlnz'] = dlnrho_dlnz
             vectors['chi_t'] = chi_t
             vectors['chi_rho'] = chi_rho
+            vectors['chi_rho_hhe'] = chi_rho_hhe
             vectors['delta'] = - dlnrho_dlnt_const_p # do save this one if going to save gyre info
 
-            vectors['n2'] = g ** 2 * rho / p * chi_t / chi_rho * (grada - gradt + b)
+            vectors['n2_yp'] = g ** 2 * rho / p * dlnrho_dlnyp * gradyp
+            vectors['n2_z'] = g ** 2 * rho / p * dlnrho_dlnz * gradz
+
+            vectors['n2_thermal'] = g ** 2 * rho / p * chi_t / chi_rho * (grada - gradt)
+            vectors['n2_composition'] = vectors['n2_z'] + vectors['n2_yp']
+            vectors['n2'] = vectors['n2_thermal'] + vectors['n2_composition']
+
+            # equivalently we could use Y, Z as the composition variables and get the same answer for physical quantities like N^2, but the
+            # relative contributions from Z and Y are different than they would be for Z and Y^\prime. in other words:
+            vectors['grady'] = grady = np.gradient(np.log(y)) / np.gradient(np.log(p))
+            vectors['n2_y_yz_basis'] = g ** 2 * rho / p * rho * y * (1. / rho_h - 1. / rho_he) * grady # different from vectors['n2_yp'] above because grad_Y != grad_Y'
+            vectors['n2_z_yz_basis'] = g ** 2 * rho / p * rho * z * (1. / rho_h - 1. / rho_z) * gradz # different from vectors['n2_z'] above because (dlnrho/dlnp)_PTY != (dlnrho/dlnp)_PTY'
+
+            vectors['n2eq'] = (self.l / self.r_eq) ** 4 * vectors['n2']
+            vectors['n2pol'] = (self.l / self.r_pol) ** 4 * vectors['n2']
 
             n2 = np.copy(vectors['n2']) # copy because it may be abused below (e.g., zero out n2<0)
             n2[n2 < 0] = 0.
             w0 = np.sqrt(const.cgrav * scalars['mtot_calc'] / scalars['rm'] ** 3)
-            scalars['max_n'] = np.sqrt(max(n2)) / w0
+            scalars['max_n'] = np.sqrt(np.max(n2)) / w0
+            scalars['max_neq'] = np.sqrt(np.max(vectors['n2eq'])) / w0
+            scalars['max_npol'] = np.sqrt(np.max(vectors['n2pol'])) / w0
 
             scalars['pi0'] = np.pi ** 2 * 2 / trapz(np.sqrt(n2), x=np.log(l))
             scalars['mean_n2_gmode_cavity'] = trapz(l * n2) / trapz(l)
-        else: # special handling for all the zones with y or z or both equal to zero
+
+        elif self.params['model_type'] == 'three_layer': # special handling for all the zones with y or z or both equal to zero
+            raise NotImplementedError('revisit calculation of brunt for three layer model before using.')
             y[y == 0] = 1e-50
             z[z == 0] = 1e-50
             grady = np.diff(np.log(y), append=0) / np.diff(np.log(p), append=0)
             gradz = np.diff(np.log(y), append=0) / np.diff(np.log(p), append=0)
-            vectors['brunt_b'] = b = chi_rho / chi_t * (chi_y * grady + chi_z * gradz)
+            vectors['brunt_b'] = b = chi_rho / chi_t * (dlnrho_dlny * grady + dlnrho_dlnz * gradz)
             vectors['n2'] = g ** 2 * rho / p * chi_t / chi_rho * (grada - gradt + b)
 
-            # more quantities for diagnostics; need not save in the long run
-            # vectors['grady'] = grady
-            # vectors['chi_y'] = chi_y
-            # vectors['chi_z'] = chi_z
             vectors['chi_t'] = chi_t
             vectors['chi_rho'] = chi_rho
             vectors['delta'] = - dlnrho_dlnt_const_p # do save this one if going to save gyre info
+        else:
+            raise ValueError('unhandled model_type in save_model.')
 
-        scalars['mean_y_xy'] = self.model.mean_y_xy
+        scalars['ymean_xy'] = self.model.ymean_xy
+        scalars['max_n'] = np.max(vectors['n2']) ** 0.5 / scalars['omega0']
 
         output['vectors'] = self.vectors = vectors
         output['scalars'] = self.scalars = scalars
@@ -1176,12 +1233,174 @@ class tof4:
             pickle.dump(output, f)
         if self.verbosity > 0:
             print('wrote {}'.format(outfile))
+            # print(f'uid was {self.uid}')
+
+    def write_gyre_model(self, downsample=False, outdir=None, rotation=False, brunt_option='default'):
+        if not hasattr(self, 'scalars'):
+            self.save_model() # in our usual pattern this would already have been called, though
+            assert hasattr(self, 'vectors'), 'expected vectors to be set following save_model call'
+        if outdir is None: outdir = f'output/{self.uid}'
+
+        vec = self.vectors.copy()
+
+        n = downsample if downsample else len(vec['l'])
+        mtot = self.scalars['mtot_calc']
+        rtot = self.scalars['rm']
+        ltot = 1.
+        version = 101 # see format spec in gyre-5.2/doc/mesa-format.pdf
+
+        # ['l', 'req', 'rpol', 'rho', 'p', 'm_calc', 'y', 'z', 't', 'gamma1', 'grada', 'g', 'dlnp_dr', 'dlnrho_dr', 'gradt', 'n2']
+        vec['k'] = np.arange(n)
+        vec['lum'] = np.ones(n) # adiabatic mode calculation doesn't need luminosity
+
+        if not rotation:
+            # leave rotation out of gyre calculation; will apply corrections after the fact
+            vec['omega'] = np.zeros(n)
+        else:
+            # rigid rotation
+            vec['omega'] = np.ones(n) * (self.small * const.cgrav * mtot / rtot ** 3) ** 0.5
+            print(vec['omega'][0])
+        outfile = f'{outdir}/model.gyre'
+
+        if False and np.any(np.diff(np.log(vec['rho'])) < -0.1): # jumps exist, record discontinuous quantities on either side
+            jumps = {}
+            ki = np.where(np.diff(np.log(vec['rho'])) < -0.1)[0]
+            li = vec['l'][ki]
+            for i, kval in enumerate(ki):
+                jumps[i] = {}
+                for qty in 'rho', 'gradt', 'gamma1', 'grada', 'delta':
+                    jumps[i][qty] = vec[qty][kval], vec[qty][kval+1]
+        else:
+            ki = []
+            li = []
+            jumps = []
+
+        # splines = {}
+        # for qty in 'm_calc', 'p', 't', 'n2': # store cubic splines before we mess with anything
+        #     splines[qty] = splrep(vec['l'], vec[qty], k=3)
+
+        # if downsampling, must resample all quantities other than k, lum, omega
+        new_l = np.linspace(vec['l'][0], vec['l'][-1], n)
+        # new_l = np.linspace(1e-4 * vec['l'][-1], n)
+        brunt_key = {
+            'default':'n2',
+            'equatorial':'n2eq',
+            'direct':'n2_direct'
+        }[brunt_option]
+        for qty in 'm_calc', 'p', 't', 'rho', 'gradt', brunt_key, 'gamma1', 'grada', 'delta':
+            vec[qty] = splev(new_l, splrep(vec['l'], vec[qty], k=1)) # was k=3 previously, changed 02222021
+        vec['l'] = new_l
+
+        if np.any(ki):
+            for i, lval in enumerate(li):
+                k = np.where(vec['l'] < lval)[0][-1] + 1
+                # add two mesh points both at l==li
+                for qty in 'm_calc', 'p', 't', brunt_key, 'lum', 'omega':
+                    # vec[qty] = np.insert(vec[qty], k, splev(lval, splines[qty]))
+                    vec[qty] = np.insert(vec[qty], k, vec[qty][k])
+                    vec[qty] = np.insert(vec[qty], k, vec[qty][k])
+                for qty in list(jumps[i]):
+                    # print(i, qty, jumps[i][qty])
+                    lo, hi = jumps[i][qty]
+                    vec[qty] = np.insert(vec[qty], k, hi)
+                    vec[qty] = np.insert(vec[qty], k, lo)
+                vec['l'] = np.insert(vec['l'], k, lval)
+                vec['l'] = np.insert(vec['l'], k, lval)
+                vec['k'] = np.insert(vec['k'], k+1, k+2)
+                vec['k'] = np.insert(vec['k'], k+1, k+1)
+                vec['k'][k+3:] += 2
+
+                vec['rho'][k+2] = 0.5 * (vec['rho'][k+1] + vec['rho'][k+3]) # splev(vec['l'][k+2], splrep(np.delete(vec['l'], k+2), np.delete(vec['rho'], k+2), k=3))
+                vec['p'][k+2] = 0.5 * (vec['p'][k+1] + vec['p'][k+3]) # splev(vec['l'][k+2], splrep(np.delete(vec['l'], k+2), np.delete(vec['rho'], k+2), k=3))
+
+        n = len(vec['k'])
+        # now set header. n may have been updated if density discontinuities are present.
+        header = '{:>5n} {:>16.8e} {:>16.8e} {:>16.8e} {:>5n}\n'.format(n, mtot, rtot, ltot, version)
+
+        with open(outfile, 'w') as fw:
+            fw.write(header)
+
+            ncols = 19
+            for k in vec['k']:
+                data_fmt = '{:>5n} ' + '{:>16.8e} ' * (ncols - 1) + '\n'
+                # debugging the three layer case (erroneous arithmetic operation in gyre)
+                # if vec['gradt'][k] < 0: vec['gradt'][k] = 0
+                # if vec['grada'][k] < 0: vec['grada'][k] = 0
+                # if abs(vec['gradt'][k]) < 1e-6: vec['gradt'][k] = 0
+                # if abs(vec['grada'][k]) < 1e-6: vec['grada'][k] = 0
+
+                if abs(vec[brunt_key][k]) < 1e-12: vec[brunt_key][k] = 1e-12 # 07202020: previously had 0, which can give gyre a hard time # reduce to 1e-20 02222021
+                if vec[brunt_key][k] < 0.: vec[brunt_key][k] = 1e-12 # 08252020 # 02222021
+
+                if self.params['model_type'] == 'three_layer':
+                    # print('beep')
+                    vec[brunt_key][k] = 0. # let reconstruct_As in gyre handle this
+                    if vec['l'][k] < li[0]:
+                        vec['gradt'][k] = 0
+                        vec['grada'][k] = 0.35
+                    if vec['grada'][k] <= 0.:
+                        vec['grada'][k] = 0.35
+
+                data = k+1, vec['l'][k], vec['m_calc'][k], vec['lum'][k], vec['p'][k], vec['t'][k], vec['rho'][k], \
+                    vec['gradt'][k], vec[brunt_key][k], vec['gamma1'][k], vec['grada'][k], vec['delta'][k], \
+                    1, 0, 0, 1, 0, 0, \
+                    vec['omega'][k]
+                fw.write(data_fmt.format(*data))
+
+    def write_pseudo_model(self, prefix='sat', downsample=False, outdir=None, brunt_key='n2'):
+        if not hasattr(self, 'scalars'):
+            self.save_model() # in our usual pattern this would already have been called, though
+            assert hasattr(self, 'vectors'), 'expected vectors to be set following save_model call'
+        if outdir is None: outdir = f'output/{self.uid}'
+
+        f = (self.r_eq - self.r_pol) / self.r_eq # (v['req']-v['rpol']) / v['req'] # the flattening "f", about 10% for Saturn.
+        # when Dahlen & Tromp 1998 and Vorontsov & Zharkov 1981 present the Radau-Darwin approximation
+        # to the Clairaut equation they call this the ellipticity.
+        # the definition of ellipticity in Fuller 2014 is different by a factor of 2/3.
+        # ell(f) follows from the expansions of a and b in polynomials and figure functions s_2n, neglecting terms of order s_2^2, s_4, etc.:
+        tof_ell = -1. / (0.5 - 1.5 / f) # or about 2/3 * f
+        tof_eta = np.gradient(tof_ell) / np.gradient(self.l) * self.l / tof_ell
+
+        mtot = self.scalars['mtot_calc']
+        rtot = self.scalars['rm']
+        small = self.scalars['small']
+        # max_n = np.max(self.vectors[brunt_key] ** 0.5)
+        with open(f'{outdir}/{prefix}.scalars', 'w') as fw:
+            fw.write(f'{mtot:12.6e} {rtot:12.6e} {small:8.5f} {brunt_key}\n')
+
+        outfile = f'{outdir}/{prefix}.in'
+
+        columns = {}
+        if downsample:
+            new_l = np.linspace(self.l[0], self.l[-1], downsample)
+            columns['r'] = new_l
+            columns['m_calc'] = np.interp(new_l, self.l, self.m_calc)
+            columns['p'] = np.interp(new_l, self.l, self.p)
+            columns['rho'] = np.interp(new_l, self.l, self.rho)
+            columns['n2'] = np.interp(new_l, self.l, self.vectors[brunt_key])
+            columns['gamma1'] = np.interp(new_l, self.l, self.vectors['gamma1'])
+            columns['ell'] = np.interp(new_l, self.l, tof_ell)
+            columns['eta'] = np.interp(new_l, self.l, tof_eta)
+        else:
+            columns['r'] = np.copy(self.l)
+            columns['m_calc'] = np.copy(self.m_calc)
+            columns['p'] = np.copy(self.p)
+            columns['rho'] = np.copy(self.rho)
+            columns['n2'] = np.copy(self.vectors[brunt_key])
+            columns['gamma1'] = np.copy(self.vectors['gamma1'])
+            columns['ell'] = tof_ell
+            columns['eta'] = tof_eta
+        with open(outfile, 'w') as fw:
+            for k, _ in enumerate(columns['r']):
+                for key in list(columns):
+                    fw.write(f"{columns[key][k]:16e} ")
+                fw.write('\n')
 
     def set_req_rpol(self):
         '''
         calculate equatorial and polar radius vectors from the figure functions s_2n and legendre polynomials P_2n.
         see N17 eq. (B.1) or ZT78 eq. (27.1).
-        also updates q from m and new r_eq[-1].
+        also calculates q from m and new r_eq[-1].
         '''
 
         # equator: mu = cos(pi/2) = 0
@@ -1361,7 +1580,7 @@ class tof4:
 
             return np.array([aa2, aa4, aa6, aa8])
 
-        if self.method_for_aa2n_solve == 'full' or force_full: # default
+        if self.method_for_aa2n_solve == 'full' or force_full:
 
             for k in np.arange(self.nz):
                 s2n = np.array([self.s2[k], self.s4[k], self.s6[k], self.s8[k]])
@@ -1377,10 +1596,7 @@ class tof4:
                 # self.aa2[k], self.aa4[k], self.aa6[k], self.aa8[k] = aa2n(sol.x, k)
 
         elif 'cubic' in self.method_for_aa2n_solve:
-            try:
-                fskip = int(self.method_for_aa2n_solve.split()[1])
-            except IndexError:
-                fskip = 10
+            fskip = int(self.method_for_aa2n_solve.split()[1])
             nskip = int(self.nz / fskip)
 
             for k in np.arange(self.nz)[::nskip]:
@@ -1394,6 +1610,7 @@ class tof4:
                 # store solution
                 self.s2[k], self.s4[k], self.s6[k], self.s8[k] = sol.x
 
+            # cubic interpolants for approximate shape functions
             tck2 = splrep(self.l[::nskip], self.s2[::nskip], k=3)
             tck4 = splrep(self.l[::nskip], self.s4[::nskip], k=3)
             tck6 = splrep(self.l[::nskip], self.s6[::nskip], k=3)
@@ -1406,6 +1623,7 @@ class tof4:
 
         else:
             raise ValueError('unable to parse aa2n solve method %s' % self.method_for_aa2n_solve)
+
 
         # note misprinted power on first term in Z+T (28.12)
         self.s0 = - 1. / 5 * self.s2 ** 2 \
@@ -1436,7 +1654,7 @@ class tof4:
         return
 
     def set_j2n_radau(self):
-        # for comparison, calculate the first-order ellipticity from Clairaut theory w/ the
+        # for comparison calculate the first-order ellipticity from Clairaut theory w/ the
         # Radau-Darwin approximation
         etanum = cumtrapz(self.rho * self.l ** 4, x=self.l, initial=1)
         etaden = cumtrapz(self.rho * self.l ** 2, x=self.l, initial=1)
@@ -1479,44 +1697,87 @@ class tof4:
 
 if __name__ == '__main__':
 
+    '''test a single model'''
+
+    omega0 = np.sqrt(const.cgrav * const.msat / const.rsat ** 3)
+    omega_sat = np.pi * 2 / (10.561 * 3600) # 10h 33m 38s = 10.56055 h
+    small = (omega_sat / omega0) ** 2 # sometimes denoted m; m_rot in the paper
+
+    z1, rstab, y2_xy, f_ice = 0.05927145799416273,    0.7068565323794515,    0.855706683903526,    0.04392185816793537    # from best model in chain n4
+
     params = {}
-    # here initializing values roughly like saturn
-    params['small'] = 0.142
-    params['mtot'] = 5.6834e29
+    params['small'] = small
+    params['adjust_small'] = True # tells the model to adjust the nondimensional spin parameter to preserve *dimensional* spin frequency as the model's mean radius changes during iterations
+    params['mtot'] = const.msat
     params['req'] = 60268e5
-    params['t1'] = 140.
-    
-    # model atmospheres just because ongp requires them; shouldn't affect anything
-    params['atm_option'] = 'f11_tables'
-    params['atm_planet'] = 'sat'
-    
-    # eos choices
-    params['z_eos_option'] = 'aneos mix'
-    params['hhe_eos_option'] = 'mh13_scvh'
-    params['ice_to_rock'] = 0.5 # water ice to rock (serpentine) mass fraction; only applies if z_eos_option is aneos mix
-    
+    params['nz'] = 4096
+    params['verbosity'] = 1
+    params['t1'] = 135.
+    params['f_ice'] = f_ice
+
     # composition choices
     if False: # make a three-layer homogeneous model: core, inner envelope, outer envelope
-        params['model_type'] = 'three_layer' # or cosine_yz, or linear_yz
+        params['model_type'] = 'three_layer'
         params['y1'] = 0.12 # outer envelope helium mass fraction
-        params['mean_y_xy'] = 0.275 # M_He / (M_H + M_He); outer iterations will adjust y2 to satisfy this
-        params['z1'] = 0.02 # outer envelope heavy element mass fraction
-        params['z2'] = 0.3 # inner envelope heavy element mass fraction
+        params['ymean_xy'] = 0.275 # M_He / (M_H + M_He); outer iterations will adjust y2 to satisfy this
+        params['z1'] = 0.5 # outer envelope heavy element mass fraction
+        params['z2'] = 0.9 # inner envelope heavy element mass fraction
         params['mcore'] = 10. # initial guess for core mass (earth masses); will be adjusted in iterations to satisfy correct total mass
-        params['pt'] = 2. # pressure (Mbar) corresponding to inner/envelope envelope boundary
-    else: # make a model with sinusoid Y and Z profiles (single stable region)
-        params['model_type'] = 'cosine_yz' # can also try linear_yz which works similarly
-        params['y2_xy'] = 0.95 # y/(x+y) in inner core
-        params['mean_y_xy'] = 0.275 # M_He / (M_H + M_He); outer iterations will adjust y1_xy to satisfy this
-        params['y1_xy'] = 0.1 # initial guess for y/(x+y) in outer envelope; will be adjusted in iterations to satisfy specified mean_y_xy
-        params['z1'] = 0.02 # outer envelope heavy element mass fraction
-        params['z2'] = 0.9 # inner core heavy element mass fraction
-        params['c'] = 0.1 # initial guess for centroid radius of stable region; will be adjusted in iterations to satisfy correct total mass
-        params['w'] = 0.2 # radial width of stable region
-        # params['w']
-        
-    t = tof4(params)
+        params['pt'] = 0.1 # pressure (Mbar) corresponding to inner/envelope envelope boundary
+    elif False: # make a model with a single stable region over which Z and Y':=Y/(X+Y) both vary
+        params['model_type'] = 'continuous'
+        params['gradient_shape'] = 'sigmoid'
+        params['y2_xy'] = 0.95 # 0.275+1e-6 # y/(x+y) in inner core
+        params['ymean_xy'] = 0.275 # ymean_xy # M_He / (M_H + M_He); outer iterations will adjust y1_xy to satisfy this
+        params['y1_xy'] = 0.27 # initial guess for y/(x+y) in outer envelope; will be adjusted in iterations to satisfy specified ymean_xy
+        params['z1'] = z1 # outer envelope heavy element mass fraction
+        params['z2'] = z2 # inner core heavy element mass fraction
+        params['c'] = 0.4 # initial guess for centroid radius of stable region; will be adjusted in iterations to satisfy correct total mass
+        params['w'] = w # radial width of stable region
+    elif True: # same, but inner cavity goes from r=0 to r=rstab; z2 will be adjusted to satisfy total mass
+        params['model_type'] = 'continuous'
+        params['gradient_shape'] = 'sigmoid'
+        params['y2_xy'] = y2_xy # y/(x+y) in inner core
+        params['ymean_xy'] = 0.275 # ymean_xy # M_He / (M_H + M_He); outer iterations will adjust y1_xy to satisfy this
+        params['y1_xy'] = 0.27 # initial guess for y/(x+y) in outer envelope; will be adjusted in iterations to satisfy specified ymean_xy
+        params['z1'] = z1 # outer envelope heavy element mass fraction # starting guess, will vary to satisfy total mass
+        params['z2'] = 0.5 # inner core heavy element mass fraction
+        # params['c'] = 0.4 # don't set these for this model type
+        # params['w'] = 0.6 # don't set these for this model type
+        params['rstab'] = rstab
+        # params['rstab_in'] = rstab_in
+    else: # make a model with an inner cavity over which Z varies and and outer cavity over which Y' varies
+        params['model_type'] = 'continuous'
+        params['gradient_shape'] = 'sigmoid'
+        params['y2_xy'] = y2_xy # y/(x+y) in inner core
+        params['ymean_xy'] = ymean_xy # M_He / (M_H + M_He); outer iterations will adjust y1_xy to satisfy this
+        params['y1_xy'] = 0.27 # initial guess for y/(x+y) outside outer cavity; will be adjusted in iterations to satisfy specified ymean_xy
+        params['z1'] = z1 # heavy element mass fraction outside inner cavity
+        params['z2'] = z2 # heavy element mass fraction within inner cavity
+        params['c2'] = 0.4 # initial guess for centroid radius of inner stable region; will be adjusted in iterations to satisfy correct total mass
+        params['w2'] = w # radial width of inner stable region
+        params['c1'] = 0.8 # centroid radius of outer stable region
+        params['w1'] = 0.05 # radial width of outer stable region
+
+    # relative tolerances
+    params['j2n_rtol'] = 1e-5
+    params['ymean_rtol'] = 1e-4
+    params['mtot_rtol'] = 1e-5
+
+    params['use_gauss_lobatto'] = True
+
+    # initialize eos objects once, can pass to many tof4 objects
+    try:
+        import mh13_scvh
+        hhe_eos = mh13_scvh.eos()
+        import aneos_mix
+        z_eos = aneos_mix.eos()
+    except OSError:
+        raise Exception('failed to initialize eos; did you unpack eos_data.tar.gz?')
+
+    # finally make a tof4 instance and relax the model
+    t = tof4(hhe_eos, z_eos, params)
     t.initialize_model()
     t.initialize_tof_vectors()
     t.relax()
-    
+    # t.write_gyre_model() # if you want to write a model in gyre format

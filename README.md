@@ -1,18 +1,22 @@
 # alice
-Fluid planet interiors with ToF4. 
 
-Depends on [ongp](https://github.com/chkvch/ongp) to make a spherical initial guess model and to provide interfaces to equations of state.
+Oblate fluid planet structure from a fourth-order theory of figures based on [Nettelmann 2017](https://doi.org/10.1051/0004-6361/201731550).
 
-### Usage
-See the main program in `gravity.py` for example usage.
+## Getting started
 
-### Output
-For a converged model `gravity.tof4.relax()` will write the final model (in the form of a pickled python dictionary) to `output/{uid}/tof4_data.pkl` where `{uid}` is sort-of-unique identifying integer (Unix time in microseconds when model is intialized). This can be loaded with something like
+Set up by setting these environment variables or adding to your shell startup script:
 ```
-import pickle
-tof = pickle.load(open('output/1597971138122883/tof4_data.pkl', 'rb'))
-
-print(list(tof)) # ['params', 'mesh_params', 'scalars', 'vectors']
-print(tof['vectors']['rho']) # [[6.96938825e+00 6.96824039e+00 6.96479720e+00 ... ]
-
+export ALICE_DIR=~/alice # or whatever path you've cloned the repo to
+export PYTHONPATH=$ALICE_DIR:$PYTHONPATH
 ```
+(or equivalent for your shell).
+
+Then unpack the eos data:
+```
+tar xvfz eos_data.tar.gz
+```
+and you're ready test the code by running
+```
+python gravity.py
+```
+to relax an oblate Saturn model. If all goes well this test model will converge and save the underlying model to `output/{uid}/tof4_data.pkl` where `{uid}` is an integer label assigned to the model when it is created.
