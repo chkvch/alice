@@ -7,6 +7,7 @@ import const
 from scipy.optimize import root
 from scipy.integrate import trapz, cumtrapz, solve_ivp
 from scipy.interpolate import splrep, splev, interp1d
+# from scipy.interpolate import interp1d
 from scipy.special import legendre
 import time
 import os
@@ -131,6 +132,7 @@ class tof4:
             for i in np.arange(2):
                 hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), 0.275 * (1. - z))
                 z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.f_ice)
+                # z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t))
                 rhoinv = z / 10 ** z_res['logrho'] + (1. - z) / 10 ** hhe_res['logrho']
                 self.model.rho = rhoinv ** -1. # 10 ** hhe_res['logrho']
                 # integrate mass conservation to update mass
@@ -340,10 +342,11 @@ class tof4:
                 # relax the shape for this rho(l)
 
                 if 'use_radau_approximation' not in list(self.params) or not self.params['use_radau_approximation']:
-                    # do full shape calculation
+                    # do full shape calculation # mongoose
                     self.set_f2n_f2np() # polynomials of shape functions
                     self.set_ss2n_ss2np() # integrals over mass distribution weighted by f_2n, f_2n'
-                    self.set_s2n() # numerical solve to get shape functions from A_2n = 0
+                    # self.set_s2n() # fast (direct) update of shape functions s_2n from A_2n = 0
+                    self.set_s2n_slow() # numerical solve to get shape functions from A_2n = 0
                     self.set_req_rpol() # get new vectors of equatorial and polar radii from shape functions
                     self.set_j2n() # functions only of S_2n at surface and R_eq
                     self.req_radau = -1
@@ -673,7 +676,8 @@ class tof4:
                     self.outer_done = True
 
                     t0 = time.time()
-                    self.set_s2n(force_full=False) # this is actually slow if force_full==True; effect on final shape functions appears negligible
+                    # self.set_s2n() # new method
+                    self.set_s2n_slow() # this is actually slow if force_full==True; effect on final shape functions appears negligible
                     # if self.verbosity > 0: print(f'final set_s2n completed in {time.time()-t0} s')
 
                     self.save_model() # calculate auxiliary quantities of interest and write the thing to disk
@@ -790,17 +794,20 @@ class tof4:
         if np.any(np.isnan(self.model.grada)):
             raise ValueError('nans in grada: y1={} y2={} z1={} z2={}'.format(self.model.y1, self.model.y2, self.model.z1, self.model.z2))
 
-        if 'alternate_t_integral' in list(self.tof_params) and self.tof_params['alternate_t_integral']:
-            # integrate on alternate pressure grid to improve accuracy
-            from scipy.interpolate import interp1d
-            p_grid = np.logspace(6, np.log10(self.p[0]), len(self.p))[::-1]
-            grada_grid = interp1d(self.p, self.model.grada, fill_value='extrapolate', kind='cubic')(p_grid)
-            t = np.exp(cumtrapz(grada_grid[::-1] / p_grid[::-1], x=p_grid[::-1], initial=0.))[::-1]
-            t *= self.model.t1
-            t = interp1d(p_grid, t, fill_value='extrapolate', kind='cubic')(self.p)
-        else:
-            t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
-            t *= self.model.t1
+        # if 'alternate_t_integral' in list(self.tof_params) and self.tof_params['alternate_t_integral']:
+        #     # integrate on alternate pressure grid to improve accuracy
+        #     from scipy.interpolate import interp1d
+        #     p_grid = np.logspace(6, np.log10(self.p[0]), len(self.p))[::-1]
+        #     grada_grid = interp1d(self.p, self.model.grada, fill_value='extrapolate', kind='cubic')(p_grid)
+        #     t = np.exp(cumtrapz(grada_grid[::-1] / p_grid[::-1], x=p_grid[::-1], initial=0.))[::-1]
+        #     t *= self.model.t1
+        #     t = interp1d(p_grid, t, fill_value='extrapolate', kind='cubic')(self.p)
+        # else:
+        #     t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
+        #     t *= self.model.t1
+
+        t = np.exp(cumtrapz(self.model.gradt[::-1] / self.p[::-1], x=self.p[::-1], initial=0.))[::-1]
+        t *= self.model.t1
 
         self.rho[:kcore] = self.model.get_rho_z(np.log10(self.p[:kcore]), np.log10(t[:kcore]))
         self.rho[kcore:] = self.model.get_rho_xyz(np.log10(self.p[kcore:]), np.log10(t[kcore:]), y[kcore:], z[kcore:])
@@ -908,6 +915,7 @@ class tof4:
         # hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), y)
         hhe_res = self.model.hhe_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.y_xy) # was previously y ;(
         z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t), self.model.f_ice)
+        # z_res = self.model.z_eos.get(np.log10(self.model.p), np.log10(self.model.t))
 
         # update densities
         rho_z = 10 ** z_res['logrho']
@@ -1124,6 +1132,7 @@ class tof4:
         z_eos = self.model.z_eos
         hhe_res = hhe_eos.get(np.log10(p), np.log10(t), yp)
         z_res = z_eos.get(np.log10(p), np.log10(t), self.model.f_ice)
+        # z_res = z_eos.get(np.log10(p), np.log10(t))
 
         vectors['gamma1'] = hhe_res['gamma1']
         grada = vectors['grada'] = self.model.grada # hhe_res['grada']
@@ -1526,7 +1535,89 @@ class tof4:
                     + self.small / 3 * (1. - 2. / 5 * self.s2 - 9. / 35 * self.s2 ** 2 \
                     - 4. / 35 * self.s2 * self.s4 + 22. / 525 * self.s2 ** 3)
 
-    def set_s2n(self, force_full=False):
+    def set_s2n(self):
+
+        '''
+
+        per naor's tip, do away with root finds and simply treat all RHS terms but the first in each of the eqs. (B.12-15) as fixed;
+        then it is trivial to update the guess for s_2n from the condition that A_2n == 0. since we will do many iterations anyway,
+        this much faster process will yield the correct shape functions in the end.
+
+        in other words, (B.12-15) can be rearranged to write
+          A_2 + s_2 * S_0 == stuff_2
+          A_4 + s_4 * S_0 == stuff_4
+          A_6 + s_6 * S_0 == stuff_6
+          A_8 + s_8 * S_0 == stuff_8
+        so since the A_2n are each zero, we can simply update s_2n from stuff_2n.
+
+        '''
+
+
+        s2 = self.s2
+        s4 = self.s4
+        s6 = self.s6
+        # s8 = self.s8 # not actually required since s_8 does not appear in any of the stuff_2n
+
+        new_s2 = (2. / 7 * s2 ** 2 + 4. / 7 * s2 * s4 - 29. / 35 * s2 ** 3 + 100. / 693 * s4 ** 2 \
+                + 454. / 1155 * s2 ** 4 - 36. / 77 * s2 ** 2 * s4) * self.ss0 \
+                + (1. - 6. / 7 * s2 - 6. / 7 * s4 + 111. / 35 * s2 ** 2 - 1242. / 385 * s2 ** 3 + 144. / 77 * s2 * s4) * self.ss2 \
+                + (-10. / 7 * s2 - 500. / 693 * s4 + 180. / 77 * s2 ** 2) * self.ss4 \
+                + (1. + 4. / 7 * s2 + 1. / 35 * s2 ** 2 + 4. / 7 * s4 - 16. / 105 * s2 ** 3 + 24. / 77 * s2 * s4) * self.ss2p \
+                + (8. / 7 * s2 + 72. / 77 * s2 ** 2 + 400. / 693 * s4) * self.ss4p \
+                + self.small / 3 * (-1. + 10. / 7 * s2 + 9. / 35 * s2 ** 2 - 4. / 7 * s4 + 20./ 77 * s2 * s4 - 26. / 105 * s2 ** 3)
+        new_s2 /= self.ss0
+
+        new_s4 = (18. / 35 * s2 ** 2 - 108. / 385 * s2 ** 3 + 40. / 77 * s2 * s4 + 90. / 143 * s2 * s6 + 162. / 1001 * s4 ** 2 \
+                + 16902. / 25025 * s2 ** 4 - 7369. / 5005 * s2 ** 2 * s4) * self.ss0 \
+                + (-54. / 35 * s2 - 60. / 77 * s4 + 648. / 385 * s2 ** 2 \
+                - 135. / 143 * s6 + 21468. / 5005 * s2 * s4 - 122688. / 25025 * s2 ** 3) * self.ss2 \
+                + (1. - 100. / 77 * s2 - 810. / 1001 * s4 + 6368. / 1001 * s2 ** 2) * self.ss4 \
+                - 315. / 143 * s2 * self.ss6 \
+                + (36. / 35 * s2 + 108. / 385 * s2 ** 2 + 40. / 77 * s4 + 3578. / 5005 * s2 * s4 \
+                - 36. / 175 * s2 ** 3 + 90. / 143 * s6) * self.ss2p \
+                + (1. + 80. / 77 * s2 + 1346. / 1001 * s2 ** 2 + 648. / 1001 * s4) * self.ss4p \
+                + 270. / 143 * s2 * self.ss6p \
+                + self.small / 3 * (-36. / 35 * s2 + 114. / 77 * s4 + 18. / 77 * s2 ** 2 \
+                - 978. / 5005 * s2 * s4 + 36. / 175 * s2 ** 3 - 90. / 143 * s6)
+        new_s4 /= self.ss0
+
+        new_s6 = (10. / 11 * s2 * s4 - 18. / 77 * s2 ** 3 + 28. / 55 * s2 * s6 + 72. / 385 * s2 ** 4 + 20. / 99 * s4 ** 2 \
+                - 54. / 77 * s2 ** 2 * s4) * self.ss0 \
+                + (-15. / 11 * s4 + 108. / 77 * s2 ** 2 - 42. / 55 * s6 - 144. / 77 * s2 ** 3 + 216. / 77 * s2 * s4) * self.ss2 \
+                + (-25. / 11 * s2 - 100. / 99 * s4 + 270. / 77 * s2 ** 2) * self.ss4 \
+                + (1. - 98. / 55 * s2) * self.ss6 \
+                + (10. / 11 * s4 + 18. / 77 * s2 ** 2 + 36. / 77 * s2 * s4 + 28. / 55 * s6) * self.ss2p \
+                + (20. / 11 * s2 + 108. / 77 * s2 ** 2 + 80. / 99 * s4) * self.ss4p \
+                + (1. + 84. / 55 * s2) * self.ss6p \
+                + self.small / 3 * (-10. / 11 * s4 - 18. / 77 * s2 ** 2 + 34. / 77 * s2 * s4 + 82. / 55 * s6)
+        new_s6 /= self.ss0
+
+        new_s8 = (56. / 65 * s2 * s6 + 72. / 715 * s2 ** 4 + 490. / 1287 * s4 ** 2 - 84. / 143 * s2 ** 2 * s4) * self.ss0 \
+                + (-84. / 65 * s6 - 144. / 143 * s2 ** 3 + 336. / 143 * s2 * s4) * self.ss2 \
+                + (-2450. / 1287 * s4 + 420. / 143 * s2 ** 2) * self.ss4 \
+                - 196. / 65 * s2 * self.ss6 \
+                + self.ss8 \
+                + (56. / 65 * s6 + 56. / 143 * s2 * s4) * self.ss2p \
+                + (1960. / 1287 * s4 + 168. / 143 * s2 ** 2) * self.ss4p \
+                + 168. / 65 * s2 * self.ss6p \
+                + self.ss8p \
+                + self.small / 3 * (-56. / 65 * s6 - 56. / 143 * s2 * s4)
+        new_s8 /= self.ss0
+
+        self.s2 = new_s2
+        self.s4 = new_s4
+        self.s6 = new_s6
+        self.s8 = new_s8
+
+        # note misprinted power on first term in Z+T (28.12)
+        self.s0 = - 1. / 5 * self.s2 ** 2 \
+                    - 2. / 105 * self.s2 ** 3 \
+                    - 1. / 9 * self.s4 ** 2 \
+                    - 2. / 35 * self.s2 ** 2 * self.s4
+
+        return
+
+    def set_s2n_slow(self, force_full=False):
         '''
         performs a root find to find the figure functions s_2n from the current S_2n, S_2n^prime, and m.
         '''
@@ -1713,7 +1804,7 @@ if __name__ == '__main__':
     params['nz'] = 4096
     params['verbosity'] = 1
     params['t1'] = 135.
-    params['f_ice'] = f_ice
+    params['f_ice'] = 0.0 # f_ice
 
     # composition choices
     if False: # make a three-layer homogeneous model: core, inner envelope, outer envelope
@@ -1766,12 +1857,16 @@ if __name__ == '__main__':
 
     params['use_gauss_lobatto'] = True
 
+    params['max_iters_inner'] = 2
+
     # initialize eos objects once, can pass to many tof4 objects
     try:
         import mh13_scvh
         hhe_eos = mh13_scvh.eos()
         import aneos_mix
         z_eos = aneos_mix.eos()
+        # import _aneos
+        # z_eos = _aneos.eos()
     except OSError:
         raise Exception('failed to initialize eos; did you unpack eos_data.tar.gz?')
 
