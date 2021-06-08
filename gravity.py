@@ -345,8 +345,8 @@ class tof4:
                     # do full shape calculation # mongoose
                     self.set_f2n_f2np() # polynomials of shape functions
                     self.set_ss2n_ss2np() # integrals over mass distribution weighted by f_2n, f_2n'
-                    # self.set_s2n() # fast (direct) update of shape functions s_2n from A_2n = 0
-                    self.set_s2n_slow() # numerical solve to get shape functions from A_2n = 0
+                    self.set_s2n() # fast (direct) update of shape functions s_2n from A_2n = 0
+                    # self.set_s2n_slow() # numerical solve to get shape functions from A_2n = 0
                     self.set_req_rpol() # get new vectors of equatorial and polar radii from shape functions
                     self.set_j2n() # functions only of S_2n at surface and R_eq
                     self.req_radau = -1
@@ -676,8 +676,8 @@ class tof4:
                     self.outer_done = True
 
                     t0 = time.time()
-                    # self.set_s2n() # new method
-                    self.set_s2n_slow() # this is actually slow if force_full==True; effect on final shape functions appears negligible
+                    self.set_s2n() # new method
+                    # self.set_s2n_slow() # this is actually slow if force_full==True; effect on final shape functions appears negligible
                     # if self.verbosity > 0: print(f'final set_s2n completed in {time.time()-t0} s')
 
                     self.save_model() # calculate auxiliary quantities of interest and write the thing to disk
