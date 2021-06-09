@@ -1,16 +1,13 @@
 from scipy.interpolate import RectBivariateSpline as rbs
-try:
-    from importlib import reload
-except:
-    pass
 import numpy as np
-import os
 
 class eos:
     def __init__(self, material, path_to_data=None):
         self.material = material
         self.columns = 'logrho', 'logt', 'logp', 'logu', 'logs'
-        if not path_to_data: path_to_data = os.environ['ALICE_DIR'] + '/eos_data'
+        if not path_to_data:
+            import os
+            path_to_data = os.environ['ALICE_DIR'] + '/eos_data'
         self.data_path = '{}/aneos_{}.dat'.format(path_to_data, self.material)
         self.data = np.genfromtxt(self.data_path, skip_header=0, names=self.columns)
 
